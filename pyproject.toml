@@ -1,0 +1,19 @@
+[project]
+name = "eznak"
+version = "0.1.0"
+description = "Автоматизированная система генерации и отложенного постинга для Telegram-каналов"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "python-dotenv",
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "alembic",
+    "pydantic-ai",
+    "aiogram",
+    "structlog",
+    "apscheduler",
+    "pillow",
+    "aiohttp",
+]

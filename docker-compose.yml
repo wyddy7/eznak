@@ -1,0 +1,9 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: eznak
+      POSTGRES_PASSWORD: eznak
+      POSTGRES_DB: eznak
+    ports:
+      - "5432:5432"
