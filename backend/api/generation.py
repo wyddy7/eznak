@@ -26,11 +26,12 @@ async def generate_phrases(
     Для MVP: channel_id — первый канал из БД.
     """
     log.info("api.generate.request")
+    structlog.get_logger(__name__).info("Hit generate endpoint!")
     result = await session.execute(select(Channel).limit(1))
     channel = result.scalar_one_or_none()
     if not channel:
         log.warning("api.generate.no_channel", reason="Таблица channels пуста. Добавь канал в БД.")
-        return {"phrases": []}
+        return {"status": "ok", "test_marker": "123", "phrases": []}
 
     channel_id: UUID = channel.id
     log.info("api.generate.channel_found", channel_id=str(channel_id), channel_name=channel.name)
@@ -47,7 +48,7 @@ async def generate_phrases(
             channel_id=str(channel_id),
             reason="LLM вернул пустой список или ранжирование отфильтровало всё. Проверь OPENROUTER_API_KEY и промпты.",
         )
-        return {"phrases": []}
+        return {"status": "ok", "test_marker": "123", "phrases": []}
 
     log.info("api.generate.success", channel_id=str(channel_id), count=len(phrases))
-    return {"phrases": phrases}
+    return {"status": "ok", "test_marker": "123", "phrases": phrases}

@@ -1,10 +1,10 @@
 """
 Telegram-бот для генерации и модерации постов.
-Шаг 4: Reply-меню, генерация, Inline-кнопки Approve/Reject/Edit.
-Статусы отображаются в сообщении, Reject не удаляет.
+Шаг 5: Планирование — Approve/Reject/Edit, Отправить на планирование, Shuffle, Confirm All.
 """
 
 import os
+import random
 from typing import Any
 
 import aiohttp
@@ -13,6 +13,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.types import ReplyKeyboardRemove
@@ -48,7 +49,8 @@ def get_main_keyboard() -> ReplyKeyboardBuilder:
     builder = ReplyKeyboardBuilder()
     builder.button(text="🎲 Сгенерировать")
     builder.button(text="📅 Ожидают постинга")
-    builder.adjust(2)
+    builder.button(text="📤 Отправить на планирование")
+    builder.adjust(2, 1)
     return builder
 
 
@@ -80,6 +82,17 @@ def _update_message_status(msg: Message, new_status: str) -> str:
     return _append_status(text, new_status)
 
 
+def _parse_phrase_text(msg: Message) -> str:
+    """Извлекает сырой текст из формата «Фраза N:\n{text}» или с суффиксом «Статус:»."""
+    text = msg.text or msg.caption or ""
+    if "\n" not in text:
+        return text.strip()
+    after_prefix = text.split("\n", 1)[1]
+    if "\n\n" in after_prefix:
+        return after_prefix.split("\n\n", 1)[0].strip()
+    return after_prefix.strip()
+
+
 async def _post_generate() -> dict[str, Any]:
     """POST /api/v1/generate — возвращает {"phrases": [...]}."""
     async with aiohttp.ClientSession() as session:
@@ -107,8 +120,59 @@ async def _get_scheduled_posts() -> dict[str, Any]:
             return await resp.json()
 
 
+async def _post_approve(phrases: list[str]) -> dict[str, Any]:
+    """POST /api/v1/posts/approve — возвращает draft_posts."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{BACKEND_URL}/api/v1/posts/approve",
+            json={"phrases": phrases},
+            headers={"X-API-Key": BACKEND_API_KEY, "Content-Type": "application/json"},
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"API error {resp.status}: {text}")
+            return await resp.json()
+
+
+async def _post_schedule_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """POST /api/v1/posts/schedule-batch."""
+    payload = [
+        {"post_id": str(it["id"]), "channel_id": str(it["channel_id"]), "time": it["suggested_time"]}
+        for it in items
+    ]
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{BACKEND_URL}/api/v1/posts/schedule-batch",
+            json=payload,
+            headers={"X-API-Key": BACKEND_API_KEY, "Content-Type": "application/json"},
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"API error {resp.status}: {text}")
+            return await resp.json()
+
+
+def _format_slots_message(draft_posts: list[dict[str, Any]]) -> str:
+    """Форматирует слоты для отображения."""
+    lines = []
+    for p in draft_posts:
+        text = p.get("text", "")
+        at = p.get("suggested_time", "—")
+        lines.append(f"• {text}\n  📅 {at} (МСК)")
+    return "\n\n".join(lines)
+
+
+def _get_slots_keyboard() -> InlineKeyboardBuilder:
+    """Inline-кнопки Shuffle и Confirm All."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔀 Shuffle", callback_data="slots:shuffle")
+    builder.button(text="✅ Confirm All", callback_data="slots:confirm")
+    builder.adjust(2)
+    return builder
+
+
 # --- Dispatcher и Middleware ---
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
 
 @dp.update.outer_middleware()
@@ -149,9 +213,10 @@ async def cmd_start(message: Message) -> None:
 
 
 @dp.message(F.text == "🎲 Сгенерировать")
-async def handle_generate(message: Message) -> None:
+async def handle_generate(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         return
+    await state.clear()
     await message.answer("Генерирую фразы...")
     try:
         data = await _post_generate()
@@ -164,6 +229,10 @@ async def handle_generate(message: Message) -> None:
         await message.answer("Фразы не сгенерированы. Проверь каналы в БД и LLM.")
         return
 
+    await state.update_data(
+        phrases={i: p for i, p in enumerate(phrases)},
+        approved_indices=[],
+    )
     for i, phrase in enumerate(phrases):
         kb = get_phrase_keyboard(i)
         await message.answer(
@@ -195,11 +264,53 @@ async def handle_scheduled(message: Message) -> None:
     await message.answer("\n\n".join(lines))
 
 
+@dp.message(F.text == "📤 Отправить на планирование")
+async def handle_send_to_planning(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    phrases = data.get("phrases", {})
+    approved_indices = data.get("approved_indices", [])
+    approved_texts = [phrases[i] for i in sorted(approved_indices) if i in phrases]
+    if not approved_texts:
+        await message.answer(
+            "Нет одобренных фраз. Нажмите Approve на нужных фразах.",
+            reply_markup=get_main_keyboard().as_markup(resize_keyboard=True),
+        )
+        return
+    try:
+        resp = await _post_approve(approved_texts)
+    except Exception as e:
+        await message.answer(f"Ошибка API: {e}")
+        return
+    draft_posts = resp.get("draft_posts", [])
+    if not draft_posts:
+        await message.answer("Не удалось создать черновики. Проверь каналы в БД.")
+        return
+    await state.update_data(draft_posts=draft_posts)
+    slots_text = _format_slots_message(draft_posts)
+    kb = _get_slots_keyboard()
+    await message.answer(
+        f"<b>Слоты для планирования:</b>\n\n{slots_text}",
+        reply_markup=kb.as_markup(),
+    )
+
+
 @dp.callback_query(F.data.startswith("approve:"))
-async def cb_approve(callback: CallbackQuery) -> None:
+async def cb_approve(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
+    _, idx = callback.data.split(":", 1)
+    phrase_idx = int(idx)
+    raw_text = _parse_phrase_text(callback.message)
+    data = await state.get_data()
+    phrases = dict(data.get("phrases", {}))
+    approved_indices = list(data.get("approved_indices", []))
+    phrases[phrase_idx] = raw_text
+    if phrase_idx not in approved_indices:
+        approved_indices.append(phrase_idx)
+    await state.update_data(phrases=phrases, approved_indices=approved_indices)
     new_text = _update_message_status(callback.message, "✅ Статус: Approved")
     await callback.message.edit_text(new_text, reply_markup=None)
     await callback.answer("Одобрено")
@@ -241,8 +352,8 @@ async def cb_edit(callback: CallbackQuery, state: FSMContext) -> None:
 @dp.message(EditPhraseStates.waiting_for_text, Command("cancel"))
 @dp.message(EditPhraseStates.waiting_for_text, F.text.casefold() == "cancel")
 async def cancel_edit(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.reply("Отменено.", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(None)
+    await message.reply("Отменено.", reply_markup=get_main_keyboard().as_markup(resize_keyboard=True))
 
 
 @dp.message(EditPhraseStates.waiting_for_text)
@@ -251,12 +362,15 @@ async def process_edit_text(message: Message, state: FSMContext) -> None:
         await message.reply("Отправь текст. Или /cancel для отмены.")
         return
     data = await state.get_data()
-    await state.clear()
     msg_id = data["edit_message_id"]
     chat_id = data["edit_chat_id"]
     phrase_idx = data["edit_phrase_idx"]
     phrase_num = data["edit_phrase_num"]
-    new_text = f"<b>Фраза {phrase_num}:</b>\n{message.text}"
+    phrases = dict(data.get("phrases", {}))
+    phrases[phrase_idx] = message.text
+    await state.update_data(phrases=phrases)
+    await state.set_state(None)
+    new_text = f"<b>Фраза {phrase_num}:</b>\n{message.text}\n\n✏️ Статус: Отредактировано"
     kb = get_phrase_keyboard(phrase_idx).as_markup()
     await message.bot.edit_message_text(
         chat_id=chat_id,
@@ -264,9 +378,61 @@ async def process_edit_text(message: Message, state: FSMContext) -> None:
         text=new_text,
         reply_markup=kb,
     )
-    await message.reply("Текст обновлён. Можно снова Approve/Reject/Edit.", reply_markup=ReplyKeyboardRemove())
+    await message.reply(
+        "Текст обновлён. Можно снова Approve/Reject/Edit.",
+        reply_markup=get_main_keyboard().as_markup(resize_keyboard=True),
+    )
 
 
+@dp.callback_query(F.data == "slots:shuffle")
+async def cb_slots_shuffle(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    data = await state.get_data()
+    draft_posts = list(data.get("draft_posts", []))
+    if not draft_posts:
+        await callback.answer("Нет слотов для перемешивания.", show_alert=True)
+        return
+    times = [p["suggested_time"] for p in draft_posts]
+    random.shuffle(times)
+    for i, p in enumerate(draft_posts):
+        draft_posts[i] = {**p, "suggested_time": times[i]}
+    await state.update_data(draft_posts=draft_posts)
+    slots_text = _format_slots_message(draft_posts)
+    kb = _get_slots_keyboard()
+    await callback.message.edit_text(
+        f"<b>Слоты для планирования:</b>\n\n{slots_text}",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer("Слоты перемешаны")
+
+
+@dp.callback_query(F.data == "slots:confirm")
+async def cb_slots_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    data = await state.get_data()
+    draft_posts = data.get("draft_posts", [])
+    if not draft_posts:
+        await callback.answer("Нет слотов для подтверждения.", show_alert=True)
+        return
+    try:
+        await _post_schedule_batch(draft_posts)
+    except Exception as e:
+        await callback.answer(f"Ошибка API: {e}", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "Расписание подтверждено. Посты ожидают постинга. Используй «📅 Ожидают постинга» для просмотра.",
+        reply_markup=None,
+    )
+    await callback.message.answer(
+        "Готово.",
+        reply_markup=get_main_keyboard().as_markup(resize_keyboard=True),
+    )
+    await callback.answer("Готово")
 
 
 async def main() -> None:
