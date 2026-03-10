@@ -112,6 +112,31 @@
 
 ---
 
+### Промпт 4.5: Логирование и отладка (structlog + stdlib)
+
+```text
+@tz.md
+Промежуточный шаг. Шаг 4.5: Интеграция structlog с stdlib logging.
+1. Прочитай документацию structlog (Standard Library) в context7. Настрой structlog так, чтобы он использовал `structlog.stdlib.LoggerFactory()` и `logging` как backend.
+2. В `backend/core/logging.py` настрой единый pipeline: structlog → stdlib → один StreamHandler (stdout). Используй `ProcessorFormatter` или `structlog.stdlib.recreate_defaults()` по документации.
+3. Убедись, что логи приложения (api.generate.*, llm_pipeline_*) и логи uvicorn выводятся в один поток и видны в консоли при запросах.
+4. Создай скрипт `scripts/seed_channel.py`: асинхронно подключается к БД, вставляет один канал в таблицу `channels` (telegram_id, name — любые тестовые), если таблица пуста. Запуск: `uv run python scripts/seed_channel.py`.
+```
+
+**🛑 ДЕЙСТВИЕ ДЛЯ ПРОВЕРКИ (Выполни сам):**
+1. Запусти `uv run python scripts/seed_channel.py` — канал должен появиться в БД.
+2. Запусти `uv run uvicorn backend.main:app --reload` и бота. Нажми «Сгенерировать» в ТГ.
+3. В консоли uvicorn должны появиться логи: `request`, `api.generate.channel_found`, `llm_pipeline_start`, `api.generate.success` (или `api.generate.no_channel` / `api.generate.empty_phrases` при ошибке).
+
+**✅ КРИТЕРИИ УСПЕХА (Остановись, когда выполнишь):**
+- Логи видны в консоли при каждом запросе.
+- После seed — фразы генерируются и отображаются в боте.
+- Напиши мне: "Шаг 4.5 завершен. Логирование работает, seed выполнен, генерация фраз ок."
+
+**Действие:** Закоммить. Переходим к FSM.
+
+---
+
 ### Промпт 5: Модерация и FSM Бота
 
 ```text

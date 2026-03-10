@@ -3,7 +3,8 @@
 from datetime import datetime, timedelta
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+import structlog
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +14,7 @@ from backend.api.deps import get_api_key
 from backend.db.models import Channel, Post, PostStatus
 from backend.db.session import get_session
 
+log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/posts", tags=["posts"])
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -64,6 +66,35 @@ class ScheduleItem(BaseModel):
 
 # --- Endpoints ---
 
+@router.get("")
+async def list_posts(
+    status: PostStatus | None = Query(None, description="Фильтр по статусу"),
+    _: str = Depends(get_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """
+    Список постов. Для бота: status=scheduled — ожидающие постинга.
+    """
+    log.info("api.posts.list", status=status.value if status else "all")
+    q = select(Post).order_by(Post.scheduled_at.asc())
+    if status is not None:
+        q = q.where(Post.status == status)
+    result = await session.execute(q)
+    posts = result.scalars().all()
+    log.info("api.posts.list.result", count=len(posts))
+    return {
+        "posts": [
+            {
+                "id": str(p.id),
+                "text": p.text[:100] + "..." if len(p.text) > 100 else p.text,
+                "scheduled_at": p.scheduled_at.isoformat() if p.scheduled_at else None,
+                "status": p.status.value,
+            }
+            for p in posts
+        ]
+    }
+
+
 @router.post("/approve")
 async def approve_posts(
     body: ApproveRequest,
@@ -74,9 +105,11 @@ async def approve_posts(
     Создаёт записи в БД со статусом draft.
     Возвращает draft_posts с id, text, channel_id, suggested_time.
     """
+    log.info("api.posts.approve", phrases_count=len(body.phrases))
     result = await session.execute(select(Channel).limit(1))
     channel = result.scalar_one_or_none()
     if not channel:
+        log.warning("api.posts.approve.no_channel", reason="Таблица channels пуста")
         return {"draft_posts": []}
 
     channel_id = channel.id
@@ -101,6 +134,7 @@ async def approve_posts(
             "suggested_time": slot.isoformat(),
         })
 
+    log.info("api.posts.approve.success", draft_count=len(draft_posts))
     return {"draft_posts": draft_posts}
 
 
@@ -115,6 +149,7 @@ async def schedule_batch(
     Обновляет посты: scheduled_at и статус scheduled.
     Время в MSK (ISO8601).
     """
+    log.info("api.posts.schedule_batch", items_count=len(body))
     for item in body:
         result = await session.execute(select(Post).where(Post.id == item.post_id))
         post = result.scalar_one_or_none()
@@ -129,4 +164,5 @@ async def schedule_batch(
         post.scheduled_at = dt
         post.status = PostStatus.scheduled
 
+    log.info("api.posts.schedule_batch.success", scheduled=len(body))
     return {"scheduled": len(body)}

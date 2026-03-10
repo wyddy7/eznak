@@ -139,6 +139,12 @@ async def run_llm_pipeline(
         channel_id=str(channel_id),
         approved_count=len(approved),
     )
+    if not approved:
+        log.warning(
+            "llm_pipeline_empty_ranker",
+            channel_id=str(channel_id),
+            reason="Ранжировщик отфильтровал все фразы (скор < 7). Попробуй другой датасет или модель.",
+        )
     log.debug(
         "llm_pipeline_ranked_output",
         channel_id=str(channel_id),
