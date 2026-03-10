@@ -1,6 +1,7 @@
 """
 Telegram-бот для генерации и модерации постов.
 Шаг 4: Reply-меню, генерация, Inline-кнопки Approve/Reject/Edit.
+Статусы отображаются в сообщении, Reject не удаляет.
 """
 
 import os
@@ -10,10 +11,17 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
+from aiogram.types import ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from dotenv import load_dotenv
+
+
+class EditPhraseStates(StatesGroup):
+    waiting_for_text = State()
 
 load_dotenv()
 
@@ -52,6 +60,24 @@ def get_phrase_keyboard(phrase_idx: int) -> InlineKeyboardBuilder:
     builder.button(text="✏️ Edit", callback_data=f"edit:{phrase_idx}")
     builder.adjust(3)
     return builder
+
+
+def _append_status(text: str, status: str) -> str:
+    """Добавляет строку статуса к тексту сообщения."""
+    return f"{text}\n\n{status}"
+
+
+def _update_message_status(msg: Message, new_status: str) -> str:
+    """
+    Возвращает обновлённый текст: если уже есть «Статус:», заменяет последний.
+    Иначе добавляет.
+    """
+    text = msg.text or msg.caption or ""
+    if "Статус:" in text:
+        parts = text.rsplit("\n\n", 1)
+        if len(parts) == 2 and "Статус:" in parts[1]:
+            return f"{parts[0]}\n\n{new_status}"
+    return _append_status(text, new_status)
 
 
 async def _post_generate() -> dict[str, Any]:
@@ -174,9 +200,9 @@ async def cb_approve(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
-    # Пока только подтверждаем — полная логика в Шаге 5
-    await callback.answer("Approve — в следующем шаге")
-    await callback.message.edit_reply_markup(reply_markup=None)
+    new_text = _update_message_status(callback.message, "✅ Статус: Approved")
+    await callback.message.edit_text(new_text, reply_markup=None)
+    await callback.answer("Одобрено")
 
 
 @dp.callback_query(F.data.startswith("reject:"))
@@ -184,17 +210,61 @@ async def cb_reject(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
-    await callback.message.delete()
-    await callback.answer("Удалено")
+    # Не удаляем — обновляем текст со статусом, сохраняем историю в чате
+    new_text = _update_message_status(callback.message, "❌ Статус: Rejected")
+    await callback.message.edit_text(new_text, reply_markup=None)
+    await callback.answer("Отклонено")
 
 
 @dp.callback_query(F.data.startswith("edit:"))
-async def cb_edit(callback: CallbackQuery) -> None:
+async def cb_edit(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
-    # FSM для редактирования — в Шаге 5
-    await callback.answer("Edit — в следующем шаге")
+    _, idx = callback.data.split(":", 1)
+    phrase_idx = int(idx)
+    msg = callback.message
+    await state.update_data(
+        edit_message_id=msg.message_id,
+        edit_chat_id=msg.chat.id,
+        edit_phrase_idx=phrase_idx,
+        edit_phrase_num=phrase_idx + 1,
+    )
+    await state.set_state(EditPhraseStates.waiting_for_text)
+    await callback.answer()
+    await msg.reply(
+        f"Введи новый текст для фразы {phrase_idx + 1}. Или /cancel для отмены.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(EditPhraseStates.waiting_for_text, Command("cancel"))
+@dp.message(EditPhraseStates.waiting_for_text, F.text.casefold() == "cancel")
+async def cancel_edit(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.reply("Отменено.", reply_markup=ReplyKeyboardRemove())
+
+
+@dp.message(EditPhraseStates.waiting_for_text)
+async def process_edit_text(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        await message.reply("Отправь текст. Или /cancel для отмены.")
+        return
+    data = await state.get_data()
+    await state.clear()
+    msg_id = data["edit_message_id"]
+    chat_id = data["edit_chat_id"]
+    phrase_idx = data["edit_phrase_idx"]
+    phrase_num = data["edit_phrase_num"]
+    new_text = f"<b>Фраза {phrase_num}:</b>\n{message.text}"
+    kb = get_phrase_keyboard(phrase_idx).as_markup()
+    await message.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=msg_id,
+        text=new_text,
+        reply_markup=kb,
+    )
+    await message.reply("Текст обновлён. Можно снова Approve/Reject/Edit.", reply_markup=ReplyKeyboardRemove())
 
 
 
