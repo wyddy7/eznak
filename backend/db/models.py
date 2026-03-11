@@ -11,6 +11,22 @@ class Base(DeclarativeBase):
     pass
 
 
+class PromptTemplate(Base):
+    __tablename__ = "prompt_templates"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    generator_system: Mapped[str] = mapped_column(Text, nullable=False)
+    generator_user_template: Mapped[str] = mapped_column(Text, nullable=False)
+    critic_system: Mapped[str] = mapped_column(Text, nullable=False)
+    critic_user_template: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class PostStatus(str, PyEnum):
     draft = "draft"
     scheduled = "scheduled"
@@ -30,8 +46,16 @@ class Channel(Base):
     dataset_source_channel_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("channels.id"), nullable=True
     )
+    prompt_template_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("prompt_templates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     posts: Mapped[list["Post"]] = relationship("Post", back_populates="channel")
+    prompt_template: Mapped["PromptTemplate | None"] = relationship(
+        "PromptTemplate", lazy="selectin"
+    )
     datasets: Mapped[list["Dataset"]] = relationship("Dataset", back_populates="channel")
 
 

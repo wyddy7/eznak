@@ -9,19 +9,18 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from backend.core.prompts import (
-    DEFAULT_DATASET,
-    PROMPT_1_SYSTEM,
-    PROMPT_1_USER_TEMPLATE,
-    PROMPT_2_SYSTEM,
-    PROMPT_2_USER_TEMPLATE,
-)
+from backend.core.config_loader import get_prompts
+from backend.core.prompts import DEFAULT_DATASET
 from backend.db.models import Channel, Dataset
 
 log = structlog.get_logger(__name__)
 
-SAMPLE_SIZE = 20
+
+def _get_sample_size() -> int:
+    """Размер выборки из датасета (из config/prompts.yaml)."""
+    return int(get_prompts().get("dataset_sample_size", 50))
 
 
 # --- Pydantic-модели для structured output ---
@@ -54,21 +53,55 @@ def _get_openrouter_model() -> str:
     return os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4")
 
 
-def _create_generator_agent() -> Agent[None, GeneratedPhrases]:
+def _create_generator_agent(system_prompt: str) -> Agent[None, GeneratedPhrases]:
     """Агент для генерации 15 фраз."""
     return Agent(
         f"openrouter:{_get_openrouter_model()}",
         output_type=GeneratedPhrases,
-        system_prompt=PROMPT_1_SYSTEM,
+        system_prompt=system_prompt,
     )
 
 
-def _create_ranker_agent() -> Agent[None, LLMResponse]:
+def _create_ranker_agent(system_prompt: str) -> Agent[None, LLMResponse]:
     """Агент для ранжирования и отбора фраз."""
     return Agent(
         f"openrouter:{_get_openrouter_model()}",
         output_type=LLMResponse,
-        system_prompt=PROMPT_2_SYSTEM,
+        system_prompt=system_prompt,
+    )
+
+
+async def _get_prompts_for_channel(
+    session: AsyncSession, channel_id: UUID
+) -> tuple[str, str, str, str, str]:
+    """
+    Возвращает (gen_system, gen_user_template, critic_system, critic_user_template, prompt_source).
+    prompt_source: имя шаблона или "yaml_fallback".
+    """
+    result = await session.execute(
+        select(Channel)
+        .options(selectinload(Channel.prompt_template))
+        .where(Channel.id == channel_id)
+    )
+    channel = result.scalar_one_or_none()
+    if channel and channel.prompt_template_id and channel.prompt_template:
+        t = channel.prompt_template
+        return (
+            t.generator_system,
+            t.generator_user_template,
+            t.critic_system,
+            t.critic_user_template,
+            t.name,
+        )
+    prompts = get_prompts()
+    gen = prompts.get("generator", {})
+    crit = prompts.get("critic", {})
+    return (
+        gen.get("system", ""),
+        gen.get("user_template", ""),
+        crit.get("system", ""),
+        crit.get("user_template", ""),
+        "yaml_fallback",
     )
 
 
@@ -78,7 +111,7 @@ async def _fetch_dataset_for_channel(session: AsyncSession, channel_id: UUID) ->
     Если у канала задан dataset_source_channel_id — берёт датасет из того канала.
     Иначе — из своего channel_id.
     Если пусто — fallback на default_dataset из YAML.
-    Случайная выборка 15–20 фраз для вариативности.
+    Случайная выборка (размер из config: dataset_sample_size) для вариативности.
     """
     channel_result = await session.execute(select(Channel).where(Channel.id == channel_id))
     channel = channel_result.scalar_one_or_none()
@@ -99,7 +132,7 @@ async def _fetch_dataset_for_channel(session: AsyncSession, channel_id: UUID) ->
         )
         phrases = list(DEFAULT_DATASET)
 
-    sample_count = min(SAMPLE_SIZE, len(phrases))
+    sample_count = min(_get_sample_size(), len(phrases))
     sampled = random.sample(phrases, sample_count)
     source = "datasets" if rows else "default_dataset"
     log.info(
@@ -131,10 +164,29 @@ async def run_llm_pipeline(
             raise ValueError("session обязателен, когда dataset не передан (нужен запрос в БД)")
         phrases_data = await _fetch_dataset_for_channel(session, channel_id)
 
-    dataset_text = "\n".join(f"- {p}" for p in phrases_data)
-    model = _get_openrouter_model()
+    if session is not None:
+        gen_system, gen_user_tpl, critic_system, critic_user_tpl, prompt_source = (
+            await _get_prompts_for_channel(session, channel_id)
+        )
+    else:
+        prompts = get_prompts()
+        gen = prompts.get("generator", {})
+        crit = prompts.get("critic", {})
+        gen_system = gen.get("system", "")
+        gen_user_tpl = gen.get("user_template", "")
+        critic_system = crit.get("system", "")
+        critic_user_tpl = crit.get("user_template", "")
+        prompt_source = "yaml_fallback"
 
-    log.info("llm_pipeline_start", channel_id=str(channel_id), dataset_size=len(phrases_data), model=model)
+    log.info(
+        "llm_pipeline_start",
+        channel_id=str(channel_id),
+        dataset_size=len(phrases_data),
+        model=_get_openrouter_model(),
+        prompt_source=prompt_source,
+    )
+
+    dataset_text = "\n".join(f"- {p}" for p in phrases_data)
     log.debug(
         "llm_pipeline_dataset",
         channel_id=str(channel_id),
@@ -143,13 +195,13 @@ async def run_llm_pipeline(
     )
 
     # --- Шаг 1: Генерация 15 фраз ---
-    gen_agent = _create_generator_agent()
-    user_prompt_1 = PROMPT_1_USER_TEMPLATE.format(dataset=dataset_text)
+    gen_agent = _create_generator_agent(gen_system)
+    user_prompt_1 = gen_user_tpl.format(dataset=dataset_text)
 
     log.debug(
         "llm_pipeline_prompt1",
         channel_id=str(channel_id),
-        system_prompt=PROMPT_1_SYSTEM,
+        system_prompt=gen_system,
         user_prompt=user_prompt_1,
     )
 
@@ -175,17 +227,17 @@ async def run_llm_pipeline(
 
     # --- Шаг 2: Ранжирование ---
     phrases_block = "\n".join(f"{i+1}. {p}" for i, p in enumerate(phrases_to_rank))
-    user_prompt_2 = PROMPT_2_USER_TEMPLATE.format(phrases=phrases_block)
+    user_prompt_2 = critic_user_tpl.format(phrases=phrases_block)
 
     log.debug(
         "llm_pipeline_prompt2",
         channel_id=str(channel_id),
-        system_prompt=PROMPT_2_SYSTEM,
+        system_prompt=critic_system,
         user_prompt=user_prompt_2,
         input_phrases=phrases_to_rank,
     )
 
-    rank_agent = _create_ranker_agent()
+    rank_agent = _create_ranker_agent(critic_system)
     result_2 = await rank_agent.run(user_prompt_2)
     ranked = result_2.output
 

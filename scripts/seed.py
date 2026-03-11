@@ -20,7 +20,8 @@ load_dotenv()
 from sqlalchemy import select
 from zoneinfo import ZoneInfo
 
-from backend.db.models import Channel, Dataset, Post, PostStatus
+from backend.core.config_loader import get_prompts
+from backend.db.models import Channel, Dataset, Post, PostStatus, PromptTemplate
 from backend.db.session import async_session_factory
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -129,6 +130,33 @@ async def main() -> None:
                         ch.dataset_source_channel_id = src_channel.id
                 channels_created.append(ch)
                 print(f"Добавлен канал: {ch.name} (id={ch.id})")
+
+        # 1.5. Шаблон "default" из YAML (идемпотентно)
+        result_tpl = await session.execute(
+            select(PromptTemplate).where(PromptTemplate.name == "default")
+        )
+        default_template = result_tpl.scalar_one_or_none()
+        if default_template is None:
+            prompts = get_prompts()
+            gen = prompts.get("generator", {})
+            crit = prompts.get("critic", {})
+            default_template = PromptTemplate(
+                name="default",
+                generator_system=gen.get("system", ""),
+                generator_user_template=gen.get("user_template", ""),
+                critic_system=crit.get("system", ""),
+                critic_user_template=crit.get("user_template", ""),
+            )
+            session.add(default_template)
+            await session.flush()
+            print("Создан шаблон промптов: default")
+        else:
+            print("Шаблон default уже есть")
+
+        # Привязываем default к каналам
+        for ch in channels_created:
+            ch.prompt_template_id = default_template.id
+        print("Шаблон default привязан ко всем каналам")
 
         await session.commit()
         # Перезагружаем сессию для дальнейших операций

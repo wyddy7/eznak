@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from backend.api.channels import router as channels_router
 from backend.api.generation import router as generation_router
 from backend.api.posts import router as posts_router
+from backend.api.prompt_templates import router as prompt_templates_router
 from backend.middleware.logging_middleware import RequestLoggingMiddleware
 from backend.services.scheduler import scheduler, setup_scheduler
 
@@ -35,6 +36,7 @@ app.add_middleware(RequestLoggingMiddleware)
 app.include_router(channels_router, prefix="/api/v1")
 app.include_router(generation_router, prefix="/api/v1")
 app.include_router(posts_router, prefix="/api/v1")
+app.include_router(prompt_templates_router, prefix="/api/v1")
 
 
 @app.get("/")
