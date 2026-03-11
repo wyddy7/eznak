@@ -1,6 +1,7 @@
 """APScheduler для автопостинга одобренных постов в Telegram."""
 
 import asyncio
+import random
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -48,26 +49,54 @@ async def _publish_scheduled_posts() -> None:
         if not posts:
             return
 
-        url = f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendMessage"
-
         async with aiohttp.ClientSession() as http:
             for post in posts:
                 try:
-                    async with http.post(
-                        url,
-                        json={"chat_id": TARGET_CHANNEL_ID, "text": post.text},
-                    ) as resp:
-                        data = await resp.json()
+                    use_media = random.random() <= 1
+                    photo_bytes = None
 
-                        if resp.status != 200 or not data.get("ok"):
-                            desc = data.get("description", "unknown")
-                            log.error(
-                                "scheduler.telegram_error",
+                    if use_media:
+                        try:
+                            from backend.services.media_gen import generate_post_image
+
+                            photo_bytes = generate_post_image(post.text)
+                        except Exception as e:
+                            log.warning(
+                                "scheduler.media_gen_failed",
                                 post_id=str(post.id),
-                                status=resp.status,
-                                description=desc,
+                                error=str(e),
                             )
-                            continue
+                            use_media = False
+
+                    if use_media and photo_bytes:
+                        url = f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendPhoto"
+                        form = aiohttp.FormData()
+                        form.add_field("chat_id", TARGET_CHANNEL_ID)
+                        form.add_field(
+                            "photo",
+                            photo_bytes,
+                            filename="post.jpg",
+                            content_type="image/jpeg",
+                        )
+                        async with http.post(url, data=form) as resp:
+                            data = await resp.json()
+                    else:
+                        url = f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendMessage"
+                        async with http.post(
+                            url,
+                            json={"chat_id": TARGET_CHANNEL_ID, "text": post.text},
+                        ) as resp:
+                            data = await resp.json()
+
+                    if resp.status != 200 or not data.get("ok"):
+                        desc = data.get("description", "unknown")
+                        log.error(
+                            "scheduler.telegram_error",
+                            post_id=str(post.id),
+                            status=resp.status,
+                            description=desc,
+                        )
+                        continue
 
                     post.status = PostStatus.posted
                     await session.commit()
@@ -83,6 +112,7 @@ async def _publish_scheduled_posts() -> None:
                         post_id=str(post.id),
                         text=text_preview,
                         scheduled_at_msk=scheduled_msk,
+                        has_media=use_media,
                     )
 
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
