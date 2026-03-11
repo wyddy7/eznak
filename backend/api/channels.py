@@ -16,6 +16,25 @@ log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/channels", tags=["channels"])
 
 
+@router.get("")
+async def list_channels(
+    _: str = Depends(get_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """
+    Список каналов (id, name, telegram_id) — для выбора в боте.
+    """
+    log.info("api.channels.list")
+    result = await session.execute(select(Channel).order_by(Channel.name))
+    channels = result.scalars().all()
+    return {
+        "channels": [
+            {"id": str(c.id), "name": c.name, "telegram_id": c.telegram_id}
+            for c in channels
+        ]
+    }
+
+
 class BulkDatasetsRequest(BaseModel):
     phrases: list[str] = Field(..., min_length=1, description="Фразы для эталонного датасета")
 

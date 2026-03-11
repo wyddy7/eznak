@@ -1,16 +1,21 @@
-"""Роутер постов: approve и schedule-batch."""
+"""Роутер постов: approve, schedule-batch, post-now."""
 
+import random
 from datetime import datetime, timedelta
 from uuid import UUID
 
+import aiohttp
 import structlog
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from zoneinfo import ZoneInfo
 
 from backend.api.deps import get_api_key
+from backend.core.config import BOT_TOKEN
+from backend.core.config_loader import get_media
 from backend.db.models import Channel, Post, PostStatus
 from backend.db.session import get_session
 
@@ -45,6 +50,7 @@ def _generate_suggested_times(count: int) -> list[datetime]:
 # --- Schemas ---
 
 class ApproveRequest(BaseModel):
+    channel_id: UUID = Field(..., description="UUID канала")
     phrases: list[str] = Field(..., min_length=1, description="Финальные тексты постов")
 
 
@@ -52,6 +58,7 @@ class DraftPostResponse(BaseModel):
     id: UUID
     text: str
     channel_id: UUID
+    channel_name: str
     suggested_time: str  # ISO8601 с таймзоной
 
     class Config:
@@ -62,6 +69,13 @@ class ScheduleItem(BaseModel):
     post_id: UUID
     channel_id: UUID
     time: str  # ISO8601
+
+
+class PostNowRequest(BaseModel):
+    post_id: UUID = Field(..., description="UUID поста для немедленной публикации")
+
+
+TELEGRAM_API = "https://api.telegram.org"
 
 
 # --- Endpoints ---
@@ -76,7 +90,7 @@ async def list_posts(
     Список постов. Для бота: status=scheduled — ожидающие постинга.
     """
     log.info("api.posts.list", status=status.value if status else "all")
-    q = select(Post).order_by(Post.scheduled_at.asc())
+    q = select(Post).options(selectinload(Post.channel)).order_by(Post.scheduled_at.asc())
     if status is not None:
         q = q.where(Post.status == status)
     result = await session.execute(q)
@@ -87,6 +101,8 @@ async def list_posts(
             {
                 "id": str(p.id),
                 "text": p.text[:100] + "..." if len(p.text) > 100 else p.text,
+                "channel_id": str(p.channel_id),
+                "channel_name": p.channel.name if p.channel else None,
                 "scheduled_at": p.scheduled_at.isoformat() if p.scheduled_at else None,
                 "status": p.status.value,
             }
@@ -102,17 +118,17 @@ async def approve_posts(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """
-    Создаёт записи в БД со статусом draft.
-    Возвращает draft_posts с id, text, channel_id, suggested_time.
+    Создаёт посты для указанного канала со статусом draft.
+    Возвращает draft_posts с id, text, channel_id, channel_name, suggested_time.
     """
-    log.info("api.posts.approve", phrases_count=len(body.phrases))
-    result = await session.execute(select(Channel).limit(1))
+    log.info("api.posts.approve", channel_id=str(body.channel_id), phrases_count=len(body.phrases))
+    result = await session.execute(select(Channel).where(Channel.id == body.channel_id))
     channel = result.scalar_one_or_none()
     if not channel:
-        log.warning("api.posts.approve.no_channel", reason="Таблица channels пуста")
-        return {"draft_posts": []}
+        raise HTTPException(status_code=404, detail="Канал не найден")
 
     channel_id = channel.id
+    channel_name = channel.name
     suggested_times = _generate_suggested_times(len(body.phrases))
 
     draft_posts: list[dict] = []
@@ -131,6 +147,7 @@ async def approve_posts(
             "id": post.id,
             "text": post.text,
             "channel_id": post.channel_id,
+            "channel_name": channel_name,
             "suggested_time": slot.isoformat(),
         })
 
@@ -166,3 +183,83 @@ async def schedule_batch(
 
     log.info("api.posts.schedule_batch.success", scheduled=len(body))
     return {"scheduled": len(body)}
+
+
+@router.post("/post-now")
+async def post_now(
+    body: PostNowRequest,
+    _: str = Depends(get_api_key),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """
+    Немедленная публикация поста в канал.
+    Находит пост, достаёт post.channel.telegram_id, отправляет туда
+    (sendMessage или sendPhoto с вероятностью из config/media.yaml, 0.3).
+    Меняет статус на posted.
+    """
+    log.info("api.posts.post_now", post_id=str(body.post_id))
+    result = await session.execute(
+        select(Post).options(selectinload(Post.channel)).where(Post.id == body.post_id)
+    )
+    post = result.scalar_one_or_none()
+    if not post:
+        raise HTTPException(status_code=404, detail="Пост не найден")
+
+    if not post.channel:
+        raise HTTPException(status_code=500, detail="Канал поста не найден")
+
+    if not BOT_TOKEN:
+        raise HTTPException(status_code=503, detail="BOT_TOKEN не задан")
+
+    target_channel_id = post.channel.telegram_id
+    channel_name = post.channel.name
+
+    image_prob = get_media().get("image_probability", 0.3)
+    use_media = random.random() <= image_prob
+    photo_bytes = None
+
+    if use_media:
+        try:
+            from backend.services.media_gen import generate_post_image
+
+            photo_bytes = generate_post_image(post.text)
+        except Exception as e:
+            log.warning("api.posts.post_now.media_gen_failed", post_id=str(post.id), error=str(e))
+            use_media = False
+
+    async with aiohttp.ClientSession() as http:
+        if use_media and photo_bytes:
+            url = f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendPhoto"
+            form = aiohttp.FormData()
+            form.add_field("chat_id", target_channel_id)
+            form.add_field("photo", photo_bytes, filename="post.jpg", content_type="image/jpeg")
+            async with http.post(url, data=form) as resp:
+                data = await resp.json()
+                status_code = resp.status
+        else:
+            url = f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendMessage"
+            async with http.post(url, json={"chat_id": target_channel_id, "text": post.text}) as resp:
+                data = await resp.json()
+                status_code = resp.status
+
+    if status_code != 200 or not data.get("ok"):
+        desc = data.get("description", "unknown")
+        log.error("api.posts.post_now.telegram_error", post_id=str(post.id), description=desc)
+        raise HTTPException(status_code=502, detail=f"Telegram API: {desc}")
+
+    post.status = PostStatus.posted
+    await session.commit()
+
+    log.info(
+        "api.posts.post_now.success",
+        post_id=str(post.id),
+        channel_name=channel_name,
+        has_media=use_media,
+    )
+    return {
+        "status": "posted",
+        "post_id": str(post.id),
+        "channel_id": str(post.channel_id),
+        "channel_name": channel_name,
+        "has_media": use_media,
+    }

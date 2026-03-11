@@ -10,10 +10,11 @@ import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select
 
-from backend.core.config import BOT_TOKEN, TARGET_CHANNEL_ID
+from backend.core.config import BOT_TOKEN
 from backend.core.config_loader import get_media
 from backend.db.models import Post, PostStatus
 from backend.db.session import async_session_factory
+from sqlalchemy.orm import selectinload
 
 log = structlog.get_logger(__name__)
 MSK = ZoneInfo("Europe/Moscow")
@@ -26,10 +27,10 @@ TELEGRAM_API = "https://api.telegram.org"
 async def _publish_scheduled_posts() -> None:
     """
     Job: раз в минуту ищем посты со status=scheduled и scheduled_at <= now (UTC).
-    Отправляем в Telegram, при успехе — status=posted.
+    Отправляем в post.channel.telegram_id, при успехе — status=posted.
     """
-    if not BOT_TOKEN or not TARGET_CHANNEL_ID:
-        log.warning("scheduler.skip", reason="BOT_TOKEN или TARGET_CHANNEL_ID не заданы")
+    if not BOT_TOKEN:
+        log.warning("scheduler.skip", reason="BOT_TOKEN не задан")
         return
 
     now_utc = datetime.now(timezone.utc)
@@ -38,6 +39,7 @@ async def _publish_scheduled_posts() -> None:
         try:
             result = await session.execute(
                 select(Post)
+                .options(selectinload(Post.channel))
                 .where(Post.status == PostStatus.scheduled)
                 .where(Post.scheduled_at <= now_utc)
                 .order_by(Post.scheduled_at.asc())
@@ -53,6 +55,11 @@ async def _publish_scheduled_posts() -> None:
         async with aiohttp.ClientSession() as http:
             for post in posts:
                 try:
+                    if not post.channel:
+                        log.warning("scheduler.skip_post", post_id=str(post.id), reason="Канал не найден")
+                        continue
+
+                    target_channel_id = post.channel.telegram_id
                     image_prob = get_media().get("image_probability", 0.03)
                     use_media = random.random() <= image_prob
                     photo_bytes = None
@@ -73,7 +80,7 @@ async def _publish_scheduled_posts() -> None:
                     if use_media and photo_bytes:
                         url = f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendPhoto"
                         form = aiohttp.FormData()
-                        form.add_field("chat_id", TARGET_CHANNEL_ID)
+                        form.add_field("chat_id", target_channel_id)
                         form.add_field(
                             "photo",
                             photo_bytes,
@@ -82,20 +89,22 @@ async def _publish_scheduled_posts() -> None:
                         )
                         async with http.post(url, data=form) as resp:
                             data = await resp.json()
+                            resp_status = resp.status
                     else:
                         url = f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendMessage"
                         async with http.post(
                             url,
-                            json={"chat_id": TARGET_CHANNEL_ID, "text": post.text},
+                            json={"chat_id": target_channel_id, "text": post.text},
                         ) as resp:
                             data = await resp.json()
+                            resp_status = resp.status
 
-                    if resp.status != 200 or not data.get("ok"):
+                    if resp_status != 200 or not data.get("ok"):
                         desc = data.get("description", "unknown")
                         log.error(
                             "scheduler.telegram_error",
                             post_id=str(post.id),
-                            status=resp.status,
+                            status=resp_status,
                             description=desc,
                         )
                         continue

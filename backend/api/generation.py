@@ -3,7 +3,8 @@
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,22 +17,25 @@ log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/generate", tags=["generation"])
 
 
+class GenerateRequest(BaseModel):
+    channel_id: UUID = Field(..., description="UUID канала для генерации")
+
+
 @router.post("")
 async def generate_phrases(
+    body: GenerateRequest,
     _: str = Depends(get_api_key),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """
     Генерирует фразы через LLM-пайплайн.
-    Для MVP: channel_id — первый канал из БД.
+    Body строго {"channel_id": "uuid"}.
     """
-    log.info("api.generate.request")
-    structlog.get_logger(__name__).info("Hit generate endpoint!")
-    result = await session.execute(select(Channel).limit(1))
+    log.info("api.generate.request", channel_id=str(body.channel_id))
+    result = await session.execute(select(Channel).where(Channel.id == body.channel_id))
     channel = result.scalar_one_or_none()
     if not channel:
-        log.warning("api.generate.no_channel", reason="Таблица channels пуста. Добавь канал в БД.")
-        return {"status": "ok", "test_marker": "123", "phrases": []}
+        raise HTTPException(status_code=404, detail="Канал не найден")
 
     channel_id: UUID = channel.id
     log.info("api.generate.channel_found", channel_id=str(channel_id), channel_name=channel.name)
@@ -48,7 +52,7 @@ async def generate_phrases(
             channel_id=str(channel_id),
             reason="LLM вернул пустой список или ранжирование отфильтровало всё. Проверь OPENROUTER_API_KEY и промпты.",
         )
-        return {"status": "ok", "test_marker": "123", "phrases": []}
+        return {"status": "ok", "channel_id": str(channel_id), "channel_name": channel.name, "phrases": []}
 
     log.info("api.generate.success", channel_id=str(channel_id), count=len(phrases))
-    return {"status": "ok", "test_marker": "123", "phrases": phrases}
+    return {"status": "ok", "channel_id": str(channel_id), "channel_name": channel.name, "phrases": phrases}
