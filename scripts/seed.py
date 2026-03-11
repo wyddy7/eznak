@@ -153,7 +153,13 @@ async def main() -> None:
             await session.flush()
             print("Создан шаблон промптов: default")
         else:
-            print("Шаблон default уже есть")
+            gen = prompts.get("generator", {})
+            crit = prompts.get("critic", {})
+            default_template.generator_system = gen.get("system", "")
+            default_template.generator_user_template = gen.get("user_template", "")
+            default_template.critic_system = crit.get("system", "")
+            default_template.critic_user_template = crit.get("user_template", "")
+            print("Обновлён шаблон промптов: default")
 
         result_aesthetic = await session.execute(
             select(PromptTemplate).where(PromptTemplate.name == "aesthetic")
@@ -175,7 +181,14 @@ async def main() -> None:
             await session.flush()
             print("Создан шаблон промптов: aesthetic")
         else:
-            print("Шаблон aesthetic уже есть")
+            aesthetic_data = prompts.get("aesthetic", {})
+            gen = aesthetic_data.get("generator", {})
+            crit = aesthetic_data.get("critic", {})
+            aesthetic_template.generator_system = gen.get("system", "")
+            aesthetic_template.generator_user_template = gen.get("user_template", "")
+            aesthetic_template.critic_system = crit.get("system", "")
+            aesthetic_template.critic_user_template = crit.get("user_template", "")
+            print("Обновлён шаблон промптов: aesthetic")
 
         # Привязка шаблона к каналу: channels.prompt_template_id -> prompt_templates.id
         # llm_pipeline при генерации загружает channel с selectinload(prompt_template)
