@@ -1,10 +1,11 @@
 """
 Telegram-бот для генерации и модерации постов.
-Шаг 5: Планирование — Approve/Reject/Edit, Отправить на планирование, Shuffle, Confirm All.
+Шаг 5: Выбор канала (Inline-кнопки), Post Now, название канала в флоу.
 """
 
 import os
 import random
+import re
 from typing import Any
 
 import aiohttp
@@ -89,16 +90,34 @@ def _parse_phrase_text(msg: Message) -> str:
         return text.strip()
     after_prefix = text.split("\n", 1)[1]
     if "\n\n" in after_prefix:
-        return after_prefix.split("\n\n", 1)[0].strip()
-    return after_prefix.strip()
+        result = after_prefix.split("\n\n", 1)[0].strip()
+    else:
+        result = after_prefix.strip()
+    # Убираем префикс «Фраза N:» если остался (для первой фразы с «Канал: X\n\nФраза 1:\n...»)
+    result = re.sub(r"^Фраза\s*\d+\s*:?\s*", "", result).strip()
+    return result
 
 
-async def _post_generate() -> dict[str, Any]:
-    """POST /api/v1/generate — возвращает {"phrases": [...]}."""
+async def _get_channels() -> dict[str, Any]:
+    """GET /api/v1/channels — возвращает {"channels": [{"id", "name", "telegram_id"}, ...]}."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{BACKEND_URL}/api/v1/channels",
+            headers={"X-API-Key": BACKEND_API_KEY},
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"API error {resp.status}: {text}")
+            return await resp.json()
+
+
+async def _post_generate(channel_id: str) -> dict[str, Any]:
+    """POST /api/v1/generate — возвращает {"phrases": [...], "channel_name": ...}."""
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"{BACKEND_URL}/api/v1/generate",
-            headers={"X-API-Key": BACKEND_API_KEY},
+            json={"channel_id": channel_id},
+            headers={"X-API-Key": BACKEND_API_KEY, "Content-Type": "application/json"},
         ) as resp:
             if resp.status != 200:
                 text = await resp.text()
@@ -120,12 +139,26 @@ async def _get_scheduled_posts() -> dict[str, Any]:
             return await resp.json()
 
 
-async def _post_approve(phrases: list[str]) -> dict[str, Any]:
+async def _post_approve(channel_id: str, phrases: list[str]) -> dict[str, Any]:
     """POST /api/v1/posts/approve — возвращает draft_posts."""
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"{BACKEND_URL}/api/v1/posts/approve",
-            json={"phrases": phrases},
+            json={"channel_id": channel_id, "phrases": phrases},
+            headers={"X-API-Key": BACKEND_API_KEY, "Content-Type": "application/json"},
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"API error {resp.status}: {text}")
+            return await resp.json()
+
+
+async def _post_post_now(post_id: str) -> dict[str, Any]:
+    """POST /api/v1/posts/post-now — публикует пост немедленно."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{BACKEND_URL}/api/v1/posts/post-now",
+            json={"post_id": post_id},
             headers={"X-API-Key": BACKEND_API_KEY, "Content-Type": "application/json"},
         ) as resp:
             if resp.status != 200:
@@ -152,22 +185,26 @@ async def _post_schedule_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
             return await resp.json()
 
 
-def _format_slots_message(draft_posts: list[dict[str, Any]]) -> str:
+def _format_slots_message(draft_posts: list[dict[str, Any]], channel_name: str | None = None) -> str:
     """Форматирует слоты для отображения."""
+    header = f"<b>Канал:</b> {channel_name}\n\n" if channel_name else ""
     lines = []
     for p in draft_posts:
         text = p.get("text", "")
         at = p.get("suggested_time", "—")
         lines.append(f"• {text}\n  📅 {at} (МСК)")
-    return "\n\n".join(lines)
+    return header + "\n\n".join(lines)
 
 
-def _get_slots_keyboard() -> InlineKeyboardBuilder:
-    """Inline-кнопки Shuffle и Confirm All."""
+def _get_slots_keyboard(draft_posts: list[dict[str, Any]]) -> InlineKeyboardBuilder:
+    """Inline-кнопки: Post Now под каждым постом (по порядку), Shuffle и Confirm All. Все по одной в ряд."""
     builder = InlineKeyboardBuilder()
+    for i, p in enumerate(draft_posts, start=1):
+        post_id = str(p.get("id", ""))
+        builder.button(text=f"🚀 Post Now ({i})", callback_data=f"post_now:{post_id}")
     builder.button(text="🔀 Shuffle", callback_data="slots:shuffle")
     builder.button(text="✅ Confirm All", callback_data="slots:confirm")
-    builder.adjust(2)
+    builder.adjust(1)  # все кнопки по одной в ряд
     return builder
 
 
@@ -217,16 +254,43 @@ async def handle_generate(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         return
     await state.clear()
-    await message.answer("Генерирую фразы...")
     try:
-        data = await _post_generate()
-        phrases = data.get("phrases", [])
+        data = await _get_channels()
+        channels = data.get("channels", [])
     except Exception as e:
         await message.answer(f"Ошибка API: {e}")
         return
 
+    if not channels:
+        await message.answer("Нет каналов. Добавь каналы в БД.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for ch in channels:
+        builder.button(text=ch.get("name", ch["id"]), callback_data=f"channel_select:{ch['id']}")
+    builder.adjust(1)
+    await message.answer("Выберите канал:", reply_markup=builder.as_markup())
+
+
+@dp.callback_query(F.data.startswith("channel_select:"))
+async def cb_channel_select(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await callback.answer()  # Сразу — иначе "query is too old" при долгой генерации
+    _, channel_id = callback.data.split(":", 1)
+    await callback.message.edit_text("Генерирую фразы...")
+    try:
+        data = await _post_generate(channel_id)
+        phrases = data.get("phrases", [])
+        channel_name = data.get("channel_name", "")
+        await state.update_data(channel_id=channel_id, channel_name=channel_name)
+    except Exception as e:
+        await callback.message.answer(f"Ошибка API: {e}")
+        return
+
     if not phrases:
-        await message.answer("Фразы не сгенерированы. Проверь каналы в БД и LLM.")
+        await callback.message.answer("Фразы не сгенерированы. Проверь каналы в БД и LLM.")
         return
 
     await state.update_data(
@@ -235,8 +299,9 @@ async def handle_generate(message: Message, state: FSMContext) -> None:
     )
     for i, phrase in enumerate(phrases):
         kb = get_phrase_keyboard(i)
-        await message.answer(
-            f"<b>Фраза {i + 1}:</b>\n{phrase}",
+        header = f"<b>Канал:</b> {channel_name}\n\n" if i == 0 else ""
+        await callback.message.answer(
+            f"{header}<b>Фраза {i + 1}:</b>\n{phrase}",
             reply_markup=kb.as_markup(),
         )
 
@@ -269,6 +334,8 @@ async def handle_send_to_planning(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         return
     data = await state.get_data()
+    channel_id = data.get("channel_id")
+    channel_name = data.get("channel_name", "")
     phrases = data.get("phrases", {})
     approved_indices = data.get("approved_indices", [])
     approved_texts = [phrases[i] for i in sorted(approved_indices) if i in phrases]
@@ -278,8 +345,11 @@ async def handle_send_to_planning(message: Message, state: FSMContext) -> None:
             reply_markup=get_main_keyboard().as_markup(resize_keyboard=True),
         )
         return
+    if not channel_id:
+        await message.answer("Канал не выбран. Начни с «🎲 Сгенерировать» и выбери канал.")
+        return
     try:
-        resp = await _post_approve(approved_texts)
+        resp = await _post_approve(channel_id, approved_texts)
     except Exception as e:
         await message.answer(f"Ошибка API: {e}")
         return
@@ -288,8 +358,8 @@ async def handle_send_to_planning(message: Message, state: FSMContext) -> None:
         await message.answer("Не удалось создать черновики. Проверь каналы в БД.")
         return
     await state.update_data(draft_posts=draft_posts)
-    slots_text = _format_slots_message(draft_posts)
-    kb = _get_slots_keyboard()
+    slots_text = _format_slots_message(draft_posts, channel_name)
+    kb = _get_slots_keyboard(draft_posts)
     await message.answer(
         f"<b>Слоты для планирования:</b>\n\n{slots_text}",
         reply_markup=kb.as_markup(),
@@ -391,6 +461,7 @@ async def cb_slots_shuffle(callback: CallbackQuery, state: FSMContext) -> None:
         return
     data = await state.get_data()
     draft_posts = list(data.get("draft_posts", []))
+    channel_name = data.get("channel_name", "")
     if not draft_posts:
         await callback.answer("Нет слотов для перемешивания.", show_alert=True)
         return
@@ -399,13 +470,48 @@ async def cb_slots_shuffle(callback: CallbackQuery, state: FSMContext) -> None:
     for i, p in enumerate(draft_posts):
         draft_posts[i] = {**p, "suggested_time": times[i]}
     await state.update_data(draft_posts=draft_posts)
-    slots_text = _format_slots_message(draft_posts)
-    kb = _get_slots_keyboard()
+    slots_text = _format_slots_message(draft_posts, channel_name)
+    kb = _get_slots_keyboard(draft_posts)
     await callback.message.edit_text(
         f"<b>Слоты для планирования:</b>\n\n{slots_text}",
         reply_markup=kb.as_markup(),
     )
     await callback.answer("Слоты перемешаны")
+
+
+@dp.callback_query(F.data.startswith("post_now:"))
+async def cb_post_now(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    _, post_id = callback.data.split(":", 1)
+    try:
+        await _post_post_now(post_id)
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
+
+    data = await state.get_data()
+    old_draft = next((p for p in data.get("draft_posts", []) if str(p.get("id")) == post_id), None)
+    t = old_draft.get("text", "") if old_draft else ""
+    published_text = t[:50] + "..." if len(t) > 50 else t
+    draft_posts = [p for p in data.get("draft_posts", []) if str(p.get("id")) != post_id]
+    await state.update_data(draft_posts=draft_posts)
+    channel_name = data.get("channel_name", "")
+    header = f"<b>Слоты для планирования:</b>\n\n✅ Опубликовано прямо сейчас: {published_text}\n\n"
+    if draft_posts:
+        slots_text = _format_slots_message(draft_posts, channel_name)
+        kb = _get_slots_keyboard(draft_posts)
+        await callback.message.edit_text(
+            header + slots_text,
+            reply_markup=kb.as_markup(),
+        )
+    else:
+        await callback.message.edit_text(
+            header + "Все посты опубликованы.",
+            reply_markup=None,
+        )
+    await callback.answer("Опубликовано")
 
 
 @dp.callback_query(F.data == "slots:confirm")
