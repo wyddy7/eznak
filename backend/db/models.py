@@ -28,6 +28,21 @@ class Channel(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
 
     posts: Mapped[list["Post"]] = relationship("Post", back_populates="channel")
+    datasets: Mapped[list["Dataset"]] = relationship("Dataset", back_populates="channel")
+
+
+class Dataset(Base):
+    __tablename__ = "datasets"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    channel_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("channels.id"), nullable=False
+    )
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+
+    channel: Mapped["Channel"] = relationship("Channel", back_populates="datasets")
 
 
 class Post(Base):
