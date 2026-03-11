@@ -16,4 +16,5 @@ dependencies = [
     "apscheduler",
     "pillow",
     "aiohttp",
+    "pyyaml>=6.0.3",
 ]

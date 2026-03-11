@@ -7,9 +7,15 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-# Позиции — доли от ширины/высоты (0.5 = центр). MVP: только center.
-# Будущее: "top", "bottom", "top_left" и т.д. (см. tehdolg.md)
-POSITIONS = {"center": (0.5, 0.5)}
+from backend.core.config_loader import get_media
+
+# Позиции загружаются из config/media.yaml
+
+
+def _get_text_positions() -> list[tuple[float, float]]:
+    media = get_media()
+    positions = media.get("text_positions", [{"x": 0.5, "y": 0.5}])
+    return [(p.get("x", 0.5), p.get("y", 0.5)) for p in positions]
 
 TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "assets" / "templates"
 FONTS_DIR = Path(__file__).resolve().parents[2] / "assets" / "fonts"
@@ -52,14 +58,17 @@ def _pick_background() -> Path:
     return random.choice(files)
 
 
-def generate_post_image(text: str, position: str = "center") -> bytes:
+def generate_post_image(
+    text: str,
+    position: tuple[float, float] | None = None,
+) -> bytes:
     """
     Генерирует изображение с текстом поста на случайном фоне.
 
     Args:
         text: Текст поста.
-        position: Позиция текста ("center" по умолчанию). Позиции задаются
-            относительными координатами для работы с фонами любого размера.
+        position: Позиция текста (x, y) — доли 0–1. Если None — случайная
+            из config/media.yaml.
 
     Returns:
         Байты JPEG-изображения.
@@ -91,7 +100,11 @@ def generate_post_image(text: str, position: str = "center") -> bytes:
         text_w = bbox[2] - bbox[0]
         text_h = bbox[3] - bbox[1]
 
-    px, py = POSITIONS.get(position, (0.5, 0.5))
+    if position is None:
+        positions = _get_text_positions()
+        px, py = random.choice(positions) if positions else (0.5, 0.5)
+    else:
+        px, py = position
     xy = (int(w * px), int(h * py))
 
     draw.multiline_text(

@@ -11,6 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select
 
 from backend.core.config import BOT_TOKEN, TARGET_CHANNEL_ID
+from backend.core.config_loader import get_media
 from backend.db.models import Post, PostStatus
 from backend.db.session import async_session_factory
 
@@ -52,7 +53,8 @@ async def _publish_scheduled_posts() -> None:
         async with aiohttp.ClientSession() as http:
             for post in posts:
                 try:
-                    use_media = random.random() <= 0.03
+                    image_prob = get_media().get("image_probability", 0.03)
+                    use_media = random.random() <= image_prob
                     photo_bytes = None
 
                     if use_media:
