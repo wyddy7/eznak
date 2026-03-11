@@ -3,6 +3,7 @@ Telegram-бот для генерации и модерации постов.
 Шаг 6: Ручной ввод времени (FSM).
 """
 
+import html
 import os
 import random
 import re
@@ -102,6 +103,10 @@ def _parse_phrase_text(msg: Message) -> str:
         result = after_prefix.strip()
     # Убираем префикс «Фраза N:» если остался (для первой фразы с «Канал: X\n\nФраза 1:\n...»)
     result = re.sub(r"^Фраза\s*\d+\s*:?\s*", "", result).strip()
+    # Извлекаем текст из <pre>...</pre> (моноширинный формат)
+    pre_match = re.search(r"<pre>(.*?)</pre>", result, re.DOTALL)
+    if pre_match:
+        result = html.unescape(pre_match.group(1).strip())
     return result
 
 
@@ -160,6 +165,51 @@ async def _post_approve(channel_id: str, phrases: list[str]) -> dict[str, Any]:
             return await resp.json()
 
 
+async def _post_approve_one(channel_id: str, text: str) -> dict[str, Any]:
+    """POST /api/v1/posts/approve-one — создаёт один draft-пост."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{BACKEND_URL}/api/v1/posts/approve-one",
+            json={"channel_id": channel_id, "text": text},
+            headers={"X-API-Key": BACKEND_API_KEY, "Content-Type": "application/json"},
+        ) as resp:
+            if resp.status != 200:
+                text_err = await resp.text()
+                raise RuntimeError(f"API error {resp.status}: {text_err}")
+            return await resp.json()
+
+
+async def _patch_post(post_id: str, text: str) -> dict[str, Any]:
+    """PATCH /api/v1/posts/{post_id} — обновляет текст draft-поста."""
+    async with aiohttp.ClientSession() as session:
+        async with session.patch(
+            f"{BACKEND_URL}/api/v1/posts/{post_id}",
+            json={"text": text},
+            headers={"X-API-Key": BACKEND_API_KEY, "Content-Type": "application/json"},
+        ) as resp:
+            if resp.status != 200:
+                text_err = await resp.text()
+                raise RuntimeError(f"API error {resp.status}: {text_err}")
+            return await resp.json()
+
+
+async def _get_draft_posts(channel_id: str | None = None) -> dict[str, Any]:
+    """GET /api/v1/posts?status=draft — черновики, опционально по каналу."""
+    params: dict[str, str] = {"status": "draft"}
+    if channel_id:
+        params["channel_id"] = channel_id
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{BACKEND_URL}/api/v1/posts",
+            params=params,
+            headers={"X-API-Key": BACKEND_API_KEY},
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"API error {resp.status}: {text}")
+            return await resp.json()
+
+
 async def _post_post_now(post_id: str) -> dict[str, Any]:
     """POST /api/v1/posts/post-now — публикует пост немедленно."""
     async with aiohttp.ClientSession() as session:
@@ -167,6 +217,19 @@ async def _post_post_now(post_id: str) -> dict[str, Any]:
             f"{BACKEND_URL}/api/v1/posts/post-now",
             json={"post_id": post_id},
             headers={"X-API-Key": BACKEND_API_KEY, "Content-Type": "application/json"},
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"API error {resp.status}: {text}")
+            return await resp.json()
+
+
+async def _post_cancel_post(post_id: str) -> dict[str, Any]:
+    """POST /api/v1/posts/{post_id}/cancel — отмена поста из расписания."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{BACKEND_URL}/api/v1/posts/{post_id}/cancel",
+            headers={"X-API-Key": BACKEND_API_KEY},
         ) as resp:
             if resp.status != 200:
                 text = await resp.text()
@@ -203,15 +266,34 @@ def _format_time_display(iso_time: str) -> str:
         return iso_time
 
 
-def _format_slots_message(draft_posts: list[dict[str, Any]], channel_name: str | None = None) -> str:
-    """Форматирует слоты для отображения."""
+MAX_MESSAGE_LEN = 3800  # запас под заголовок и HTML
+PER_PAGE = 5
+
+
+def _format_slots_message(
+    draft_posts: list[dict[str, Any]],
+    channel_name: str | None = None,
+    page: int = 0,
+    per_page: int = 5,
+) -> tuple[str, int]:
+    """Форматирует слоты для отображения. Возвращает (text, total_pages)."""
+    total_pages = max(1, (len(draft_posts) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = min(start + per_page, len(draft_posts))
+    page_posts = draft_posts[start:end]
+
     header = f"<b>Канал:</b> {channel_name}\n\n" if channel_name else ""
     lines = []
-    for p in draft_posts:
+    for i, p in enumerate(page_posts, start=start + 1):
         text = p.get("text", "")
         at = _format_time_display(p.get("suggested_time", "—"))
         lines.append(f"• {text}\n  📅 {at} (МСК)")
-    return header + "\n\n".join(lines)
+    body = "\n\n".join(lines)
+    result = header + body
+    if total_pages > 1:
+        result += f"\n\nСтраница {page + 1} из {total_pages}"
+    return result, total_pages
 
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -233,17 +315,122 @@ def _parse_manual_time(text: str) -> str | None:
         return None
 
 
-def _get_slots_keyboard(draft_posts: list[dict[str, Any]]) -> InlineKeyboardBuilder:
-    """Inline-кнопки: Post Now, Manual Time и Confirm под каждым постом, Shuffle и Confirm All."""
+def _get_slots_keyboard(
+    draft_posts: list[dict[str, Any]],
+    page: int = 0,
+    per_page: int = 5,
+    show_back_channel: bool = False,
+) -> InlineKeyboardBuilder:
+    """Inline-кнопки: Post Now, Manual Time, Confirm под постами страницы, Shuffle, Confirm All, пагинация, «← Другой канал»."""
     builder = InlineKeyboardBuilder()
-    for i, p in enumerate(draft_posts, start=1):
+    total_pages = max(1, (len(draft_posts) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = min(start + per_page, len(draft_posts))
+    page_posts = draft_posts[start:end]
+
+    for i, p in enumerate(page_posts, start=start + 1):
         post_id = str(p.get("id", ""))
         builder.button(text=f"🚀 Post Now ({i})", callback_data=f"post_now:{post_id}")
         builder.button(text="⏰ Задать время вручную", callback_data=f"manual_time:{post_id}")
         builder.button(text="✅", callback_data=f"slots_confirm_one:{post_id}")
+
+    if total_pages > 1:
+        if page > 0:
+            builder.button(text="◀", callback_data=f"slots_page:{page - 1}")
+        if page < total_pages - 1:
+            builder.button(text="▶", callback_data=f"slots_page:{page + 1}")
+
     builder.button(text="🔀 Shuffle", callback_data="slots:shuffle")
     builder.button(text="✅ Confirm All", callback_data="slots:confirm")
-    builder.adjust(3)  # 3 кнопки на пост (Post Now, Manual Time, Confirm)
+    if show_back_channel:
+        builder.button(text="← Другой канал", callback_data="planning_back")
+    builder.adjust(3)  # 3 кнопки на пост
+    return builder
+
+
+def _get_channels_with_scheduled(posts: list[dict[str, Any]]) -> list[tuple[str, str, int]]:
+    """Каналы с запланированными постами: (channel_id, channel_name, count)."""
+    from collections import defaultdict
+
+    by_channel: dict[str, tuple[str, int]] = {}  # channel_id -> (channel_name, count)
+    for p in posts:
+        cid = str(p.get("channel_id", ""))
+        cname = p.get("channel_name") or "Без канала"
+        if cid not in by_channel:
+            by_channel[cid] = (cname, 0)
+        by_channel[cid] = (cname, by_channel[cid][1] + 1)
+    return [(cid, cname, cnt) for cid, (cname, cnt) in sorted(by_channel.items(), key=lambda x: x[1][0])]
+
+
+def _filter_posts_by_channel(posts: list[dict[str, Any]], channel_id: str) -> list[dict[str, Any]]:
+    """Фильтрует посты по channel_id, сортирует по scheduled_at."""
+    filtered = [p for p in posts if str(p.get("channel_id")) == channel_id]
+    return sorted(filtered, key=lambda p: p.get("scheduled_at") or "")
+
+
+def _format_scheduled_channel_posts(
+    ordered_posts: list[dict[str, Any]],
+    page: int = 0,
+    per_page: int = 5,
+) -> tuple[str, int]:
+    """Форматирует посты канала с нумерацией. Возвращает (text, total_pages)."""
+    total_pages = max(1, (len(ordered_posts) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = min(start + per_page, len(ordered_posts))
+    page_posts = ordered_posts[start:end]
+
+    lines = []
+    for i, p in enumerate(page_posts, start=start + 1):
+        text = p.get("text", "")
+        at = _format_time_display(p.get("scheduled_at", "—"))
+        lines.append(f"<b>{i}.</b> {text}\n  📅 {at}")
+    result = "\n\n".join(lines)
+    if total_pages > 1:
+        result += f"\n\nСтраница {page + 1} из {total_pages}"
+    return result, total_pages
+
+
+def _get_scheduled_channel_keyboard(
+    ordered_posts: list[dict[str, Any]],
+    page: int = 0,
+    per_page: int = 5,
+) -> InlineKeyboardBuilder:
+    """Кнопки отмены для постов страницы + пагинация + «← Другой канал»."""
+    builder = InlineKeyboardBuilder()
+    total_pages = max(1, (len(ordered_posts) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = min(start + per_page, len(ordered_posts))
+    page_posts = ordered_posts[start:end]
+
+    for i, p in enumerate(page_posts, start=start + 1):
+        post_id = str(p.get("id", ""))
+        builder.button(text=f"🗑️ Отменить ({i})", callback_data=f"cancel_scheduled:{post_id}")
+
+    if total_pages > 1:
+        if page > 0:
+            builder.button(text="◀", callback_data=f"scheduled_page:{page - 1}")
+        if page < total_pages - 1:
+            builder.button(text="▶", callback_data=f"scheduled_page:{page + 1}")
+
+    builder.button(text="← Другой канал", callback_data="scheduled_back")
+    builder.adjust(1)
+    return builder
+
+
+def _get_scheduled_channels_keyboard(
+    channels: list[tuple[str, str, int]],
+) -> InlineKeyboardBuilder:
+    """Кнопки выбора канала: «Канал 1 (3)» и т.д."""
+    builder = InlineKeyboardBuilder()
+    for cid, cname, cnt in channels:
+        builder.button(
+            text=f"{cname} ({cnt})",
+            callback_data=f"scheduled_channel:{cid}",
+        )
+    builder.adjust(1)
     return builder
 
 
@@ -335,12 +522,14 @@ async def cb_channel_select(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(
         phrases={i: p for i, p in enumerate(phrases)},
         approved_indices=[],
+        approved_post_ids={},
     )
     for i, phrase in enumerate(phrases):
         kb = get_phrase_keyboard(i)
         header = f"<b>Канал:</b> {channel_name}\n\n" if i == 0 else ""
+        escaped = html.escape(phrase)
         await callback.message.answer(
-            f"{header}<b>Фраза {i + 1}:</b>\n{phrase}",
+            f"{header}<b>Фраза {i + 1}:</b>\n<pre>{escaped}</pre>",
             reply_markup=kb.as_markup(),
         )
 
@@ -360,49 +549,256 @@ async def handle_scheduled(message: Message) -> None:
         await message.answer("Нет постов, ожидающих постинга.")
         return
 
-    lines = []
-    for p in posts:
-        text = p.get("text", "")
-        at = p.get("scheduled_at", "—")
-        lines.append(f"• {text}\n  📅 {at}")
-    await message.answer("\n\n".join(lines))
+    channels = _get_channels_with_scheduled(posts)
+    kb = _get_scheduled_channels_keyboard(channels)
+    await message.answer("Выберите канал:", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data.startswith("scheduled_channel:"))
+async def cb_scheduled_channel_select(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    _, channel_id = callback.data.split(":", 1)
+    await callback.answer()
+    try:
+        data = await _get_scheduled_posts()
+        posts = data.get("posts", [])
+    except Exception as e:
+        await callback.message.edit_text(f"Ошибка API: {e}")
+        return
+    channel_posts = _filter_posts_by_channel(posts, channel_id)
+    channel_name = channel_posts[0].get("channel_name", "Канал") if channel_posts else "Канал"
+    await state.update_data(scheduled_channel_id=channel_id, scheduled_page=0)
+    if not channel_posts:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="← Другой канал", callback_data="scheduled_back")
+        kb.adjust(1)
+        await callback.message.edit_text(
+            f"Нет постов для канала «{channel_name}».",
+            reply_markup=kb.as_markup(),
+        )
+        return
+    text, _ = _format_scheduled_channel_posts(channel_posts, page=0, per_page=PER_PAGE)
+    kb = _get_scheduled_channel_keyboard(channel_posts, page=0, per_page=PER_PAGE)
+    await callback.message.edit_text(
+        f"<b>Ожидают постинга — {channel_name}:</b>\n\n{text}",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data == "scheduled_back")
+async def cb_scheduled_back(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await callback.answer()
+    try:
+        data = await _get_scheduled_posts()
+        posts = data.get("posts", [])
+    except Exception as e:
+        await callback.message.edit_text(f"Ошибка API: {e}")
+        return
+    if not posts:
+        await callback.message.edit_text("Нет постов, ожидающих постинга.", reply_markup=None)
+        return
+    channels = _get_channels_with_scheduled(posts)
+    kb = _get_scheduled_channels_keyboard(channels)
+    await callback.message.edit_text("Выберите канал:", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data.startswith("scheduled_page:"))
+async def cb_scheduled_page(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    _, page_str = callback.data.split(":", 1)
+    page = int(page_str)
+    await callback.answer()
+    data = await state.get_data()
+    channel_id = data.get("scheduled_channel_id")
+    if not channel_id:
+        return
+    try:
+        resp = await _get_scheduled_posts()
+        posts = resp.get("posts", [])
+    except Exception as e:
+        await callback.message.edit_text(f"Ошибка API: {e}")
+        return
+    channel_posts = _filter_posts_by_channel(posts, channel_id)
+    channel_name = channel_posts[0].get("channel_name", "Канал") if channel_posts else "Канал"
+    if not channel_posts:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="← Другой канал", callback_data="scheduled_back")
+        kb.adjust(1)
+        await callback.message.edit_text("Нет постов для этого канала.", reply_markup=kb.as_markup())
+        return
+    await state.update_data(scheduled_page=page)
+    text, _ = _format_scheduled_channel_posts(channel_posts, page=page, per_page=PER_PAGE)
+    kb = _get_scheduled_channel_keyboard(channel_posts, page=page, per_page=PER_PAGE)
+    await callback.message.edit_text(
+        f"<b>Ожидают постинга — {channel_name}:</b>\n\n{text}",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("cancel_scheduled:"))
+async def cb_cancel_scheduled(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    _, post_id = callback.data.split(":", 1)
+    try:
+        await _post_cancel_post(post_id)
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
+    state_data = await state.get_data()
+    channel_id = state_data.get("scheduled_channel_id")
+    try:
+        resp = await _get_scheduled_posts()
+        posts = resp.get("posts", [])
+    except Exception as e:
+        await callback.answer(f"Ошибка API: {e}", show_alert=True)
+        return
+    if not channel_id:
+        channels = _get_channels_with_scheduled(posts)
+        kb = _get_scheduled_channels_keyboard(channels)
+        await callback.message.edit_text("Выберите канал:", reply_markup=kb.as_markup())
+        await callback.answer("Пост отменён")
+        return
+    channel_posts = _filter_posts_by_channel(posts, channel_id)
+    channel_name = channel_posts[0].get("channel_name", "Канал") if channel_posts else "Канал"
+    if not channel_posts:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="← Другой канал", callback_data="scheduled_back")
+        kb.adjust(1)
+        await callback.message.edit_text(
+            "Нет постов для этого канала. Все отменены.",
+            reply_markup=kb.as_markup(),
+        )
+    else:
+        page = state_data.get("scheduled_page", 0)
+        total_pages = max(1, (len(channel_posts) + PER_PAGE - 1) // PER_PAGE)
+        page = min(page, total_pages - 1)
+        await state.update_data(scheduled_page=page)
+        text, _ = _format_scheduled_channel_posts(channel_posts, page=page, per_page=PER_PAGE)
+        kb = _get_scheduled_channel_keyboard(channel_posts, page=page, per_page=PER_PAGE)
+        await callback.message.edit_text(
+            f"<b>Ожидают постинга — {channel_name}:</b>\n\n{text}",
+            reply_markup=kb.as_markup(),
+        )
+    await callback.answer("Пост отменён")
 
 
 @dp.message(F.text == "📤 Отправить на планирование")
 async def handle_send_to_planning(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         return
-    data = await state.get_data()
-    channel_id = data.get("channel_id")
-    channel_name = data.get("channel_name", "")
-    phrases = data.get("phrases", {})
-    approved_indices = data.get("approved_indices", [])
-    approved_texts = [phrases[i] for i in sorted(approved_indices) if i in phrases]
-    if not approved_texts:
-        await message.answer(
-            "Нет одобренных фраз. Нажмите Approve на нужных фразах.",
-            reply_markup=get_main_keyboard().as_markup(resize_keyboard=True),
-        )
-        return
-    if not channel_id:
-        await message.answer("Канал не выбран. Начни с «🎲 Сгенерировать» и выбери канал.")
-        return
     try:
-        resp = await _post_approve(channel_id, approved_texts)
+        data = await _get_draft_posts()
+        posts = data.get("posts", [])
     except Exception as e:
         await message.answer(f"Ошибка API: {e}")
         return
-    draft_posts = resp.get("draft_posts", [])
-    if not draft_posts:
-        await message.answer("Не удалось создать черновики. Проверь каналы в БД.")
+
+    if not posts:
+        await message.answer(
+            "Нет черновиков. Нажми Approve на фразах.",
+            reply_markup=get_main_keyboard().as_markup(resize_keyboard=True),
+        )
         return
-    await state.update_data(draft_posts=draft_posts)
-    slots_text = _format_slots_message(draft_posts, channel_name)
-    kb = _get_slots_keyboard(draft_posts)
-    await message.answer(
+
+    channels = _get_channels_with_scheduled(posts)
+    builder = InlineKeyboardBuilder()
+    for cid, cname, cnt in channels:
+        builder.button(
+            text=f"{cname} ({cnt})",
+            callback_data=f"planning_channel:{cid}",
+        )
+    builder.adjust(1)
+    await message.answer("Выберите канал:", reply_markup=builder.as_markup())
+
+
+@dp.callback_query(F.data.startswith("planning_channel:"))
+async def cb_planning_channel_select(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    _, channel_id = callback.data.split(":", 1)
+    await callback.answer()
+    try:
+        data = await _get_draft_posts(channel_id)
+        draft_posts = data.get("posts", [])
+    except Exception as e:
+        await callback.message.edit_text(f"Ошибка API: {e}")
+        return
+
+    if not draft_posts:
+        await callback.message.edit_text("Нет черновиков для этого канала.")
+        return
+
+    channel_name = draft_posts[0].get("channel_name", "Канал") if draft_posts else "Канал"
+    await state.update_data(draft_posts=draft_posts, planning_channel_id=channel_id, channel_name=channel_name, slots_page=0)
+    slots_text, _ = _format_slots_message(draft_posts, channel_name, page=0, per_page=PER_PAGE)
+    kb = _get_slots_keyboard(draft_posts, page=0, per_page=PER_PAGE, show_back_channel=True)
+    await callback.message.edit_text(
         f"<b>Слоты для планирования:</b>\n\n{slots_text}",
         reply_markup=kb.as_markup(),
     )
+
+
+@dp.callback_query(F.data.startswith("slots_page:"))
+async def cb_slots_page(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    _, page_str = callback.data.split(":", 1)
+    page = int(page_str)
+    await callback.answer()
+    data = await state.get_data()
+    draft_posts = list(data.get("draft_posts", []))
+    channel_name = data.get("channel_name", "")
+    if not draft_posts:
+        await callback.message.edit_text("Нет слотов.", reply_markup=None)
+        return
+    await state.update_data(slots_page=page)
+    slots_text, _ = _format_slots_message(draft_posts, channel_name, page=page, per_page=PER_PAGE)
+    show_back = bool(data.get("planning_channel_id"))
+    kb = _get_slots_keyboard(draft_posts, page=page, per_page=PER_PAGE, show_back_channel=show_back)
+    await callback.message.edit_text(
+        f"<b>Слоты для планирования:</b>\n\n{slots_text}",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data == "planning_back")
+async def cb_planning_back(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await callback.answer()
+    try:
+        data = await _get_draft_posts()
+        posts = data.get("posts", [])
+    except Exception as e:
+        await callback.message.edit_text(f"Ошибка API: {e}")
+        return
+
+    if not posts:
+        await callback.message.edit_text("Нет черновиков. Нажми Approve на фразах.", reply_markup=None)
+        await state.clear()
+        return
+
+    channels = _get_channels_with_scheduled(posts)
+    builder = InlineKeyboardBuilder()
+    for cid, cname, cnt in channels:
+        builder.button(
+            text=f"{cname} ({cnt})",
+            callback_data=f"planning_channel:{cid}",
+        )
+    builder.adjust(1)
+    await callback.message.edit_text("Выберите канал:", reply_markup=builder.as_markup())
 
 
 @dp.callback_query(F.data.startswith("approve:"))
@@ -414,12 +810,28 @@ async def cb_approve(callback: CallbackQuery, state: FSMContext) -> None:
     phrase_idx = int(idx)
     raw_text = _parse_phrase_text(callback.message)
     data = await state.get_data()
+    channel_id = data.get("channel_id")
+    if not channel_id:
+        await callback.answer("Канал не выбран.", show_alert=True)
+        return
     phrases = dict(data.get("phrases", {}))
     approved_indices = list(data.get("approved_indices", []))
+    approved_post_ids = dict(data.get("approved_post_ids", {}))
     phrases[phrase_idx] = raw_text
+    try:
+        if phrase_idx in approved_post_ids:
+            await _patch_post(approved_post_ids[phrase_idx], raw_text)
+        else:
+            resp = await _post_approve_one(channel_id, raw_text)
+            post_id = resp.get("id")
+            if post_id:
+                approved_post_ids[phrase_idx] = post_id
+    except Exception as e:
+        await callback.answer(f"Ошибка API: {e}", show_alert=True)
+        return
     if phrase_idx not in approved_indices:
         approved_indices.append(phrase_idx)
-    await state.update_data(phrases=phrases, approved_indices=approved_indices)
+    await state.update_data(phrases=phrases, approved_indices=approved_indices, approved_post_ids=approved_post_ids)
     new_text = _update_message_status(callback.message, "✅ Статус: Approved")
     await callback.message.edit_text(new_text, reply_markup=None)
     await callback.answer("Одобрено")
@@ -476,10 +888,19 @@ async def process_edit_text(message: Message, state: FSMContext) -> None:
     phrase_idx = data["edit_phrase_idx"]
     phrase_num = data["edit_phrase_num"]
     phrases = dict(data.get("phrases", {}))
+    approved_post_ids = dict(data.get("approved_post_ids", {}))
     phrases[phrase_idx] = message.text
+    if phrase_idx in approved_post_ids:
+        post_id = approved_post_ids[phrase_idx]
+        try:
+            await _patch_post(post_id, message.text)
+        except Exception as e:
+            await message.reply(f"Ошибка обновления поста в БД: {e}")
+            return
     await state.update_data(phrases=phrases)
     await state.set_state(None)
-    new_text = f"<b>Фраза {phrase_num}:</b>\n{message.text}\n\n✏️ Статус: Отредактировано"
+    escaped = html.escape(message.text)
+    new_text = f"<b>Фраза {phrase_num}:</b>\n<pre>{escaped}</pre>\n\n✏️ Статус: Отредактировано"
     kb = get_phrase_keyboard(phrase_idx).as_markup()
     await message.bot.edit_message_text(
         chat_id=chat_id,
@@ -547,8 +968,10 @@ async def process_manual_time(message: Message, state: FSMContext) -> None:
     draft_posts[idx] = {**draft_posts[idx], "suggested_time": iso_time}
     await state.update_data(draft_posts=draft_posts)
     await state.set_state(None)
-    slots_text = _format_slots_message(draft_posts, channel_name)
-    kb = _get_slots_keyboard(draft_posts)
+    page = data.get("slots_page", 0)
+    slots_text, _ = _format_slots_message(draft_posts, channel_name, page=page, per_page=PER_PAGE)
+    show_back = bool(data.get("planning_channel_id"))
+    kb = _get_slots_keyboard(draft_posts, page=page, per_page=PER_PAGE, show_back_channel=show_back)
     await message.bot.edit_message_text(
         chat_id=chat_id,
         message_id=msg_id,
@@ -576,9 +999,10 @@ async def cb_slots_shuffle(callback: CallbackQuery, state: FSMContext) -> None:
     random.shuffle(times)
     for i, p in enumerate(draft_posts):
         draft_posts[i] = {**p, "suggested_time": times[i]}
-    await state.update_data(draft_posts=draft_posts)
-    slots_text = _format_slots_message(draft_posts, channel_name)
-    kb = _get_slots_keyboard(draft_posts)
+    await state.update_data(draft_posts=draft_posts, slots_page=0)
+    slots_text, _ = _format_slots_message(draft_posts, channel_name, page=0, per_page=PER_PAGE)
+    show_back = bool(data.get("planning_channel_id"))
+    kb = _get_slots_keyboard(draft_posts, page=0, per_page=PER_PAGE, show_back_channel=show_back)
     await callback.message.edit_text(
         f"<b>Слоты для планирования:</b>\n\n{slots_text}",
         reply_markup=kb.as_markup(),
@@ -607,8 +1031,13 @@ async def cb_post_now(callback: CallbackQuery, state: FSMContext) -> None:
     channel_name = data.get("channel_name", "")
     header = f"<b>Слоты для планирования:</b>\n\n✅ Опубликовано прямо сейчас: {published_text}\n\n"
     if draft_posts:
-        slots_text = _format_slots_message(draft_posts, channel_name)
-        kb = _get_slots_keyboard(draft_posts)
+        page = data.get("slots_page", 0)
+        total_pages = max(1, (len(draft_posts) + PER_PAGE - 1) // PER_PAGE)
+        page = min(page, total_pages - 1)
+        await state.update_data(draft_posts=draft_posts, slots_page=page)
+        slots_text, _ = _format_slots_message(draft_posts, channel_name, page=page, per_page=PER_PAGE)
+        show_back = bool(data.get("planning_channel_id"))
+        kb = _get_slots_keyboard(draft_posts, page=page, per_page=PER_PAGE, show_back_channel=show_back)
         await callback.message.edit_text(
             header + slots_text,
             reply_markup=kb.as_markup(),
@@ -640,10 +1069,14 @@ async def cb_slots_confirm_one(callback: CallbackQuery, state: FSMContext) -> No
         await callback.answer(f"Ошибка API: {e}", show_alert=True)
         return
     draft_posts = [p for p in draft_posts if str(p.get("id")) != post_id]
-    await state.update_data(draft_posts=draft_posts)
+    page = data.get("slots_page", 0)
+    total_pages = max(1, (len(draft_posts) + PER_PAGE - 1) // PER_PAGE)
+    page = min(page, total_pages - 1)
+    await state.update_data(draft_posts=draft_posts, slots_page=page)
     if draft_posts:
-        slots_text = _format_slots_message(draft_posts, channel_name)
-        kb = _get_slots_keyboard(draft_posts)
+        slots_text, _ = _format_slots_message(draft_posts, channel_name, page=page, per_page=PER_PAGE)
+        show_back = bool(data.get("planning_channel_id"))
+        kb = _get_slots_keyboard(draft_posts, page=page, per_page=PER_PAGE, show_back_channel=show_back)
         await callback.message.edit_text(
             f"<b>Слоты для планирования:</b>\n\n{slots_text}",
             reply_markup=kb.as_markup(),
