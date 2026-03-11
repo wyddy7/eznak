@@ -2,7 +2,9 @@
 
 import os
 import random
+from datetime import datetime
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import structlog
 from pydantic import BaseModel, Field
@@ -16,6 +18,21 @@ from backend.core.prompts import DEFAULT_DATASET
 from backend.db.models import Channel, Dataset
 
 log = structlog.get_logger(__name__)
+
+MSK = ZoneInfo("Europe/Moscow")
+MONTHS_RU = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+WEEKDAYS_RU = [
+    "понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье",
+]
+
+
+def _format_today_msk() -> str:
+    """Человекочитаемая дата для промпта: '12 марта 2026, среда'."""
+    now = datetime.now(MSK)
+    return f"{now.day} {MONTHS_RU[now.month - 1]} {now.year}, {WEEKDAYS_RU[now.weekday()]}"
 
 
 def _get_sample_size() -> int:
@@ -197,6 +214,7 @@ async def run_llm_pipeline(
     # --- Шаг 1: Генерация 15 фраз ---
     gen_agent = _create_generator_agent(gen_system)
     user_prompt_1 = gen_user_tpl.format(dataset=dataset_text)
+    user_prompt_1 += f"\n\nКонтекст: сегодня {_format_today_msk()}. Учитывай сезон при упоминании погоды и времени года."
 
     log.debug(
         "llm_pipeline_prompt1",
