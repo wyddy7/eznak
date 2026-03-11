@@ -1,12 +1,14 @@
 """
 Telegram-бот для генерации и модерации постов.
-Шаг 5: Выбор канала (Inline-кнопки), Post Now, название канала в флоу.
+Шаг 6: Ручной ввод времени (FSM).
 """
 
 import os
 import random
 import re
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -24,6 +26,11 @@ from dotenv import load_dotenv
 
 class EditPhraseStates(StatesGroup):
     waiting_for_text = State()
+
+
+class ManualTimeStates(StatesGroup):
+    waiting_for_time = State()
+
 
 load_dotenv()
 
@@ -185,26 +192,58 @@ async def _post_schedule_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
             return await resp.json()
 
 
+def _format_time_display(iso_time: str) -> str:
+    """Преобразует ISO8601 в читаемый формат ДД.ММ.ГГГГ ЧЧ:ММ."""
+    if not iso_time or iso_time == "—":
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except (ValueError, TypeError):
+        return iso_time
+
+
 def _format_slots_message(draft_posts: list[dict[str, Any]], channel_name: str | None = None) -> str:
     """Форматирует слоты для отображения."""
     header = f"<b>Канал:</b> {channel_name}\n\n" if channel_name else ""
     lines = []
     for p in draft_posts:
         text = p.get("text", "")
-        at = p.get("suggested_time", "—")
+        at = _format_time_display(p.get("suggested_time", "—"))
         lines.append(f"• {text}\n  📅 {at} (МСК)")
     return header + "\n\n".join(lines)
 
 
+MSK = ZoneInfo("Europe/Moscow")
+
+
+def _parse_manual_time(text: str) -> str | None:
+    """
+    Парсит время в формате ДД.ММ.ГГГГ ЧЧ:ММ (МСК).
+    Возвращает ISO8601 строку или None при ошибке.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.strptime(text, "%d.%m.%Y %H:%M")
+        dt = dt.replace(tzinfo=MSK)
+        return dt.isoformat()
+    except ValueError:
+        return None
+
+
 def _get_slots_keyboard(draft_posts: list[dict[str, Any]]) -> InlineKeyboardBuilder:
-    """Inline-кнопки: Post Now под каждым постом (по порядку), Shuffle и Confirm All. Все по одной в ряд."""
+    """Inline-кнопки: Post Now, Manual Time и Confirm под каждым постом, Shuffle и Confirm All."""
     builder = InlineKeyboardBuilder()
     for i, p in enumerate(draft_posts, start=1):
         post_id = str(p.get("id", ""))
         builder.button(text=f"🚀 Post Now ({i})", callback_data=f"post_now:{post_id}")
+        builder.button(text="⏰ Задать время вручную", callback_data=f"manual_time:{post_id}")
+        builder.button(text="✅", callback_data=f"slots_confirm_one:{post_id}")
     builder.button(text="🔀 Shuffle", callback_data="slots:shuffle")
     builder.button(text="✅ Confirm All", callback_data="slots:confirm")
-    builder.adjust(1)  # все кнопки по одной в ряд
+    builder.adjust(3)  # 3 кнопки на пост (Post Now, Manual Time, Confirm)
     return builder
 
 
@@ -454,6 +493,74 @@ async def process_edit_text(message: Message, state: FSMContext) -> None:
     )
 
 
+@dp.callback_query(F.data.startswith("manual_time:"))
+async def cb_manual_time(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    _, post_id = callback.data.split(":", 1)
+    data = await state.get_data()
+    draft_posts = data.get("draft_posts", [])
+    if not any(str(p.get("id")) == post_id for p in draft_posts):
+        await callback.answer("Пост не найден в слотах.", show_alert=True)
+        return
+    await state.update_data(
+        manual_time_post_id=post_id,
+        manual_time_message_id=callback.message.message_id,
+        manual_time_chat_id=callback.message.chat.id,
+    )
+    await state.set_state(ManualTimeStates.waiting_for_time)
+    await callback.answer()
+    await callback.message.reply(
+        "Введи время в формате ДД.ММ.ГГГГ ЧЧ:ММ (МСК). Или /cancel для отмены.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(ManualTimeStates.waiting_for_time, Command("cancel"))
+@dp.message(ManualTimeStates.waiting_for_time, F.text.casefold() == "cancel")
+async def cancel_manual_time(message: Message, state: FSMContext) -> None:
+    await state.set_state(None)
+    await message.reply("Отменено.", reply_markup=get_main_keyboard().as_markup(resize_keyboard=True))
+
+
+@dp.message(ManualTimeStates.waiting_for_time)
+async def process_manual_time(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        await message.reply("Введи время в формате ДД.ММ.ГГГГ ЧЧ:ММ (МСК). Или /cancel для отмены.")
+        return
+    iso_time = _parse_manual_time(message.text)
+    if iso_time is None:
+        await message.reply("Неверный формат, попробуй снова. Или /cancel для отмены.")
+        return
+    data = await state.get_data()
+    post_id = data.get("manual_time_post_id")
+    msg_id = data.get("manual_time_message_id")
+    chat_id = data.get("manual_time_chat_id")
+    draft_posts = list(data.get("draft_posts", []))
+    channel_name = data.get("channel_name", "")
+    idx = next((i for i, p in enumerate(draft_posts) if str(p.get("id")) == post_id), None)
+    if idx is None:
+        await state.set_state(None)
+        await message.reply("Пост не найден в слотах.", reply_markup=get_main_keyboard().as_markup(resize_keyboard=True))
+        return
+    draft_posts[idx] = {**draft_posts[idx], "suggested_time": iso_time}
+    await state.update_data(draft_posts=draft_posts)
+    await state.set_state(None)
+    slots_text = _format_slots_message(draft_posts, channel_name)
+    kb = _get_slots_keyboard(draft_posts)
+    await message.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=msg_id,
+        text=f"<b>Слоты для планирования:</b>\n\n{slots_text}",
+        reply_markup=kb.as_markup(),
+    )
+    await message.reply(
+        "Время обновлено.",
+        reply_markup=get_main_keyboard().as_markup(resize_keyboard=True),
+    )
+
+
 @dp.callback_query(F.data == "slots:shuffle")
 async def cb_slots_shuffle(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
@@ -512,6 +619,46 @@ async def cb_post_now(callback: CallbackQuery, state: FSMContext) -> None:
             reply_markup=None,
         )
     await callback.answer("Опубликовано")
+
+
+@dp.callback_query(F.data.startswith("slots_confirm_one:"))
+async def cb_slots_confirm_one(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    _, post_id = callback.data.split(":", 1)
+    data = await state.get_data()
+    draft_posts = list(data.get("draft_posts", []))
+    channel_name = data.get("channel_name", "")
+    post = next((p for p in draft_posts if str(p.get("id")) == post_id), None)
+    if not post:
+        await callback.answer("Пост не найден.", show_alert=True)
+        return
+    try:
+        await _post_schedule_batch([post])
+    except Exception as e:
+        await callback.answer(f"Ошибка API: {e}", show_alert=True)
+        return
+    draft_posts = [p for p in draft_posts if str(p.get("id")) != post_id]
+    await state.update_data(draft_posts=draft_posts)
+    if draft_posts:
+        slots_text = _format_slots_message(draft_posts, channel_name)
+        kb = _get_slots_keyboard(draft_posts)
+        await callback.message.edit_text(
+            f"<b>Слоты для планирования:</b>\n\n{slots_text}",
+            reply_markup=kb.as_markup(),
+        )
+    else:
+        await state.clear()
+        await callback.message.edit_text(
+            "Все посты подтверждены. Используй «📅 Ожидают постинга» для просмотра.",
+            reply_markup=None,
+        )
+        await callback.message.answer(
+            "Готово.",
+            reply_markup=get_main_keyboard().as_markup(resize_keyboard=True),
+        )
+    await callback.answer("Пост подтверждён")
 
 
 @dp.callback_query(F.data == "slots:confirm")
