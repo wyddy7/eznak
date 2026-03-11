@@ -27,6 +27,9 @@ class Channel(Base):
     telegram_id: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     is_posting_channel: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    dataset_source_channel_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("channels.id"), nullable=True
+    )
 
     posts: Mapped[list["Post"]] = relationship("Post", back_populates="channel")
     datasets: Mapped[list["Dataset"]] = relationship("Dataset", back_populates="channel")

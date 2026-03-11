@@ -17,7 +17,7 @@ from backend.core.prompts import (
     PROMPT_2_SYSTEM,
     PROMPT_2_USER_TEMPLATE,
 )
-from backend.db.models import Dataset
+from backend.db.models import Channel, Dataset
 
 log = structlog.get_logger(__name__)
 
@@ -74,12 +74,18 @@ def _create_ranker_agent() -> Agent[None, LLMResponse]:
 
 async def _fetch_dataset_for_channel(session: AsyncSession, channel_id: UUID) -> list[str]:
     """
-    Загружает фразы из datasets WHERE channel_id = ?.
+    Загружает фразы из datasets.
+    Если у канала задан dataset_source_channel_id — берёт датасет из того канала.
+    Иначе — из своего channel_id.
     Если пусто — fallback на default_dataset из YAML.
     Случайная выборка 15–20 фраз для вариативности.
     """
+    channel_result = await session.execute(select(Channel).where(Channel.id == channel_id))
+    channel = channel_result.scalar_one_or_none()
+    effective_id = channel.dataset_source_channel_id if channel and channel.dataset_source_channel_id else channel_id
+
     result = await session.execute(
-        select(Dataset.text).where(Dataset.channel_id == channel_id)
+        select(Dataset.text).where(Dataset.channel_id == effective_id)
     )
     rows = result.scalars().all()
     phrases = [r for r in rows if r and r.strip()]
@@ -88,18 +94,21 @@ async def _fetch_dataset_for_channel(session: AsyncSession, channel_id: UUID) ->
         log.info(
             "llm_pipeline_dataset_empty",
             channel_id=str(channel_id),
+            source_channel_id=str(effective_id),
             fallback="default_dataset",
         )
         phrases = list(DEFAULT_DATASET)
 
     sample_count = min(SAMPLE_SIZE, len(phrases))
     sampled = random.sample(phrases, sample_count)
+    source = "datasets" if rows else "default_dataset"
     log.info(
         "llm_pipeline_dataset_loaded",
         channel_id=str(channel_id),
+        source_channel_id=str(effective_id),
         total=len(phrases),
         sampled=sample_count,
-        source="datasets" if rows else "default_dataset",
+        source=source,
     )
     return sampled
 

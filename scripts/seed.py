@@ -27,7 +27,7 @@ MSK = ZoneInfo("Europe/Moscow")
 
 CHANNELS = [
     {"telegram_id": "-1003812297034", "name": "ЭТО ЗНАК", "is_posting_channel": False},
-    {"telegram_id": "-1003592368865", "name": "Канал 2", "is_posting_channel": True},
+    {"telegram_id": "-1003592368865", "name": "Канал 2", "is_posting_channel": True, "dataset_source_name": "ЭТО ЗНАК"},
 ]
 
 # Плейсхолдеры для постов (для проверки постинга)
@@ -97,6 +97,15 @@ async def main() -> None:
                 if getattr(existing, "is_posting_channel", True) != is_posting:
                     existing.is_posting_channel = is_posting
                     updated = True
+                ds_source_name = ch_data.get("dataset_source_name")
+                if ds_source_name:
+                    result_src = await session.execute(
+                        select(Channel).where(Channel.name == ds_source_name)
+                    )
+                    src_channel = result_src.scalar_one_or_none()
+                    if src_channel and (getattr(existing, "dataset_source_channel_id", None) != src_channel.id):
+                        existing.dataset_source_channel_id = src_channel.id
+                        updated = True
                 if updated:
                     print(f"Обновлён канал: {ch_data['name']} (telegram_id={existing.telegram_id})")
                 else:
@@ -110,6 +119,14 @@ async def main() -> None:
                 )
                 session.add(ch)
                 await session.flush()
+                ds_source_name = ch_data.get("dataset_source_name")
+                if ds_source_name:
+                    result_src = await session.execute(
+                        select(Channel).where(Channel.name == ds_source_name)
+                    )
+                    src_channel = result_src.scalar_one_or_none()
+                    if src_channel:
+                        ch.dataset_source_channel_id = src_channel.id
                 channels_created.append(ch)
                 print(f"Добавлен канал: {ch.name} (id={ch.id})")
 
