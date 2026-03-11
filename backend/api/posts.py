@@ -26,25 +26,23 @@ MSK = ZoneInfo("Europe/Moscow")
 
 # Слоты по МСК для suggested_time (часы дня)
 DEFAULT_SLOT_HOURS = [9, 12, 15, 18, 21]
+MAX_POSTS_PER_DAY = 2
 
 
 def _generate_suggested_times(count: int) -> list[datetime]:
-    """Генерирует слоты времени по МСК на ближайшие дни."""
+    """Генерирует слоты времени по МСК. Не более MAX_POSTS_PER_DAY постов в день."""
     now = datetime.now(MSK)
-    # Начинаем с завтрашнего дня, чтобы было время на планирование
     start = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    hours_to_use = DEFAULT_SLOT_HOURS[:MAX_POSTS_PER_DAY]
     slots: list[datetime] = []
-    day_offset = 0
-    hour_idx = 0
-    while len(slots) < count:
+    for i in range(count):
+        day_offset = i // MAX_POSTS_PER_DAY
+        hour_idx = i % MAX_POSTS_PER_DAY
         day = start + timedelta(days=day_offset)
-        hour = DEFAULT_SLOT_HOURS[hour_idx % len(DEFAULT_SLOT_HOURS)]
+        hour = hours_to_use[hour_idx]
         slot = day.replace(hour=hour, minute=0, second=0, microsecond=0)
         slots.append(slot)
-        hour_idx += 1
-        if hour_idx % len(DEFAULT_SLOT_HOURS) == 0:
-            day_offset += 1
-    return slots[:count]
+    return slots
 
 
 # --- Schemas ---
