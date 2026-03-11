@@ -26,8 +26,8 @@ from backend.db.session import async_session_factory
 MSK = ZoneInfo("Europe/Moscow")
 
 CHANNELS = [
-    {"telegram_id": "-1003812297034", "name": "ЭТО ЗНАК"},
-    {"telegram_id": "-1003592368865", "name": "Канал 2"},
+    {"telegram_id": "-1003812297034", "name": "ЭТО ЗНАК", "is_posting_channel": False},
+    {"telegram_id": "-1003592368865", "name": "Канал 2", "is_posting_channel": True},
 ]
 
 # Плейсхолдеры для постов (для проверки постинга)
@@ -88,10 +88,17 @@ async def main() -> None:
                 select(Channel).where(Channel.telegram_id == ch_data["telegram_id"])
             )
             existing = result.scalar_one_or_none()
+            is_posting = ch_data.get("is_posting_channel", True)
             if existing:
+                updated = False
                 if existing.name != ch_data["name"]:
                     existing.name = ch_data["name"]
-                    print(f"Обновлено имя канала: {ch_data['name']} (telegram_id={existing.telegram_id})")
+                    updated = True
+                if getattr(existing, "is_posting_channel", True) != is_posting:
+                    existing.is_posting_channel = is_posting
+                    updated = True
+                if updated:
+                    print(f"Обновлён канал: {ch_data['name']} (telegram_id={existing.telegram_id})")
                 else:
                     print(f"Канал уже есть: {existing.name} (telegram_id={existing.telegram_id})")
                 channels_created.append(existing)
@@ -99,6 +106,7 @@ async def main() -> None:
                 ch = Channel(
                     telegram_id=ch_data["telegram_id"],
                     name=ch_data["name"],
+                    is_posting_channel=is_posting,
                 )
                 session.add(ch)
                 await session.flush()

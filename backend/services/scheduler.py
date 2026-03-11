@@ -58,6 +58,13 @@ async def _publish_scheduled_posts() -> None:
                     if not post.channel:
                         log.warning("scheduler.skip_post", post_id=str(post.id), reason="Канал не найден")
                         continue
+                    if not getattr(post.channel, "is_posting_channel", True):
+                        log.warning(
+                            "scheduler.skip_post",
+                            post_id=str(post.id),
+                            reason="Канал dataset-only, постинг запрещён",
+                        )
+                        continue
 
                     target_channel_id = post.channel.telegram_id
                     image_prob = get_media().get("image_probability", 0.03)

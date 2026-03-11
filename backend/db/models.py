@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from enum import Enum as PyEnum
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -26,6 +26,7 @@ class Channel(Base):
     )
     telegram_id: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    is_posting_channel: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     posts: Mapped[list["Post"]] = relationship("Post", back_populates="channel")
     datasets: Mapped[list["Dataset"]] = relationship("Dataset", back_populates="channel")

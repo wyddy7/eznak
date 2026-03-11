@@ -18,14 +18,19 @@ router = APIRouter(prefix="/channels", tags=["channels"])
 
 @router.get("")
 async def list_channels(
+    posting_only: bool = False,
     _: str = Depends(get_api_key),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """
     Список каналов (id, name, telegram_id) — для выбора в боте.
+    posting_only: если True — только каналы с is_posting_channel=True.
     """
-    log.info("api.channels.list")
-    result = await session.execute(select(Channel).order_by(Channel.name))
+    log.info("api.channels.list", posting_only=posting_only)
+    query = select(Channel).order_by(Channel.name)
+    if posting_only:
+        query = query.where(Channel.is_posting_channel.is_(True))
+    result = await session.execute(query)
     channels = result.scalars().all()
     return {
         "channels": [

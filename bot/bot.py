@@ -118,11 +118,20 @@ def _parse_phrase_text(msg: Message) -> str:
     return result
 
 
-async def _get_channels() -> dict[str, Any]:
-    """GET /api/v1/channels — возвращает {"channels": [{"id", "name", "telegram_id"}, ...]}."""
+def _posting_channel_ids(channels_data: dict[str, Any]) -> set[str]:
+    """Из ответа _get_channels извлекает множество id постинг-каналов."""
+    return {str(c["id"]) for c in channels_data.get("channels", [])}
+
+
+async def _get_channels(posting_only: bool = True) -> dict[str, Any]:
+    """GET /api/v1/channels — возвращает {"channels": [{"id", "name", "telegram_id"}, ...]}.
+    posting_only: если True — только каналы для постинга (без dataset-only).
+    """
     async with aiohttp.ClientSession() as session:
+        params = {"posting_only": "true"} if posting_only else {}
         async with session.get(
             f"{BACKEND_URL}/api/v1/channels",
+            params=params,
             headers={"X-API-Key": BACKEND_API_KEY},
         ) as resp:
             if resp.status != 200:
@@ -357,13 +366,20 @@ def _get_slots_keyboard(
     return builder
 
 
-def _get_channels_with_scheduled(posts: list[dict[str, Any]]) -> list[tuple[str, str, int]]:
-    """Каналы с запланированными постами: (channel_id, channel_name, count)."""
+def _get_channels_with_scheduled(
+    posts: list[dict[str, Any]],
+    posting_channel_ids: set[str] | None = None,
+) -> list[tuple[str, str, int]]:
+    """Каналы с запланированными постами: (channel_id, channel_name, count).
+    posting_channel_ids: если задано — только каналы из этого множества (исключает dataset-only).
+    """
     from collections import defaultdict
 
     by_channel: dict[str, tuple[str, int]] = {}  # channel_id -> (channel_name, count)
     for p in posts:
         cid = str(p.get("channel_id", ""))
+        if posting_channel_ids is not None and cid not in posting_channel_ids:
+            continue
         cname = p.get("channel_name") or "Без канала"
         if cid not in by_channel:
             by_channel[cid] = (cname, 0)
@@ -556,6 +572,8 @@ async def handle_scheduled(message: Message) -> None:
     try:
         data = await _get_scheduled_posts()
         posts = data.get("posts", [])
+        ch_data = await _get_channels(posting_only=True)
+        posting_ids = _posting_channel_ids(ch_data)
     except Exception as e:
         await message.answer(f"Ошибка API: {e}")
         return
@@ -564,7 +582,7 @@ async def handle_scheduled(message: Message) -> None:
         await message.answer("Нет постов, ожидающих постинга.")
         return
 
-    channels = _get_channels_with_scheduled(posts)
+    channels = _get_channels_with_scheduled(posts, posting_channel_ids=posting_ids)
     kb = _get_scheduled_channels_keyboard(channels)
     await message.answer("Выберите канал:", reply_markup=kb.as_markup())
 
@@ -611,13 +629,15 @@ async def cb_scheduled_back(callback: CallbackQuery) -> None:
     try:
         data = await _get_scheduled_posts()
         posts = data.get("posts", [])
+        ch_data = await _get_channels(posting_only=True)
+        posting_ids = _posting_channel_ids(ch_data)
     except Exception as e:
         await callback.message.edit_text(f"Ошибка API: {e}")
         return
     if not posts:
         await callback.message.edit_text("Нет постов, ожидающих постинга.", reply_markup=None)
         return
-    channels = _get_channels_with_scheduled(posts)
+    channels = _get_channels_with_scheduled(posts, posting_channel_ids=posting_ids)
     kb = _get_scheduled_channels_keyboard(channels)
     await callback.message.edit_text("Выберите канал:", reply_markup=kb.as_markup())
 
@@ -673,11 +693,13 @@ async def cb_cancel_scheduled(callback: CallbackQuery, state: FSMContext) -> Non
     try:
         resp = await _get_scheduled_posts()
         posts = resp.get("posts", [])
+        ch_data = await _get_channels(posting_only=True)
+        posting_ids = _posting_channel_ids(ch_data)
     except Exception as e:
         await callback.answer(f"Ошибка API: {e}", show_alert=True)
         return
     if not channel_id:
-        channels = _get_channels_with_scheduled(posts)
+        channels = _get_channels_with_scheduled(posts, posting_channel_ids=posting_ids)
         kb = _get_scheduled_channels_keyboard(channels)
         await callback.message.edit_text("Выберите канал:", reply_markup=kb.as_markup())
         await callback.answer("Пост отменён")
@@ -713,6 +735,8 @@ async def handle_send_to_planning(message: Message, state: FSMContext) -> None:
     try:
         data = await _get_draft_posts()
         posts = data.get("posts", [])
+        ch_data = await _get_channels(posting_only=True)
+        posting_ids = _posting_channel_ids(ch_data)
     except Exception as e:
         await message.answer(f"Ошибка API: {e}")
         return
@@ -724,7 +748,7 @@ async def handle_send_to_planning(message: Message, state: FSMContext) -> None:
         )
         return
 
-    channels = _get_channels_with_scheduled(posts)
+    channels = _get_channels_with_scheduled(posts, posting_channel_ids=posting_ids)
     builder = InlineKeyboardBuilder()
     for cid, cname, cnt in channels:
         builder.button(
@@ -796,6 +820,8 @@ async def cb_planning_back(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         data = await _get_draft_posts()
         posts = data.get("posts", [])
+        ch_data = await _get_channels(posting_only=True)
+        posting_ids = _posting_channel_ids(ch_data)
     except Exception as e:
         await callback.message.edit_text(f"Ошибка API: {e}")
         return
@@ -805,7 +831,7 @@ async def cb_planning_back(callback: CallbackQuery, state: FSMContext) -> None:
         await state.clear()
         return
 
-    channels = _get_channels_with_scheduled(posts)
+    channels = _get_channels_with_scheduled(posts, posting_channel_ids=posting_ids)
     builder = InlineKeyboardBuilder()
     for cid, cname, cnt in channels:
         builder.button(
