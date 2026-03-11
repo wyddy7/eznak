@@ -1,11 +1,14 @@
 """LLM-пайплайн: генерация 15 фраз -> ранжирование -> топ M фраз (Pydantic)."""
 
 import os
+import random
 from uuid import UUID
 
 import structlog
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.prompts import (
     DEFAULT_DATASET,
@@ -14,8 +17,11 @@ from backend.core.prompts import (
     PROMPT_2_SYSTEM,
     PROMPT_2_USER_TEMPLATE,
 )
+from backend.db.models import Dataset
 
 log = structlog.get_logger(__name__)
+
+SAMPLE_SIZE = 20
 
 
 # --- Pydantic-модели для structured output ---
@@ -66,15 +72,56 @@ def _create_ranker_agent() -> Agent[None, LLMResponse]:
     )
 
 
+async def _fetch_dataset_for_channel(session: AsyncSession, channel_id: UUID) -> list[str]:
+    """
+    Загружает фразы из datasets WHERE channel_id = ?.
+    Если пусто — fallback на default_dataset из YAML.
+    Случайная выборка 15–20 фраз для вариативности.
+    """
+    result = await session.execute(
+        select(Dataset.text).where(Dataset.channel_id == channel_id)
+    )
+    rows = result.scalars().all()
+    phrases = [r for r in rows if r and r.strip()]
+
+    if not phrases:
+        log.info(
+            "llm_pipeline_dataset_empty",
+            channel_id=str(channel_id),
+            fallback="default_dataset",
+        )
+        phrases = list(DEFAULT_DATASET)
+
+    sample_count = min(SAMPLE_SIZE, len(phrases))
+    sampled = random.sample(phrases, sample_count)
+    log.info(
+        "llm_pipeline_dataset_loaded",
+        channel_id=str(channel_id),
+        total=len(phrases),
+        sampled=sample_count,
+        source="datasets" if rows else "default_dataset",
+    )
+    return sampled
+
+
 async def run_llm_pipeline(
     channel_id: UUID,
+    session: AsyncSession | None = None,
     dataset: list[str] | None = None,
 ) -> list[RankedPhrase]:
     """
     Цепочка: Prompt 1 (15 фраз) -> Prompt 2 (ранжирование).
     Возвращает список RankedPhrase (макс. 7).
+    dataset: если передан — используется как есть; иначе — запрос в БД + рандомизация (session обязателен).
     """
-    phrases_data = dataset or DEFAULT_DATASET
+    if dataset is not None:
+        phrases_data = dataset
+        log.info("llm_pipeline_dataset_override", channel_id=str(channel_id), size=len(phrases_data))
+    else:
+        if session is None:
+            raise ValueError("session обязателен, когда dataset не передан (нужен запрос в БД)")
+        phrases_data = await _fetch_dataset_for_channel(session, channel_id)
+
     dataset_text = "\n".join(f"- {p}" for p in phrases_data)
     model = _get_openrouter_model()
 

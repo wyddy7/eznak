@@ -36,7 +36,7 @@ async def generate_phrases(
     channel_id: UUID = channel.id
     log.info("api.generate.channel_found", channel_id=str(channel_id), channel_name=channel.name)
     try:
-        ranked = await run_llm_pipeline(channel_id=channel_id)
+        ranked = await run_llm_pipeline(channel_id=channel_id, session=session)
     except Exception as e:
         log.exception("api.generate.llm_error", channel_id=str(channel_id), error=str(e))
         raise
