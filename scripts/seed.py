@@ -8,7 +8,7 @@ import asyncio
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -131,13 +131,14 @@ async def main() -> None:
                 channels_created.append(ch)
                 print(f"Добавлен канал: {ch.name} (id={ch.id})")
 
-        # 1.5. Шаблон "default" из YAML (идемпотентно)
+        # 1.5. Шаблоны промптов из YAML (идемпотентно) → INSERT в prompt_templates (БД)
+        prompts = get_prompts()
+
         result_tpl = await session.execute(
             select(PromptTemplate).where(PromptTemplate.name == "default")
         )
         default_template = result_tpl.scalar_one_or_none()
         if default_template is None:
-            prompts = get_prompts()
             gen = prompts.get("generator", {})
             crit = prompts.get("critic", {})
             default_template = PromptTemplate(
@@ -146,6 +147,7 @@ async def main() -> None:
                 generator_user_template=gen.get("user_template", ""),
                 critic_system=crit.get("system", ""),
                 critic_user_template=crit.get("user_template", ""),
+                created_at=datetime.now(timezone.utc),
             )
             session.add(default_template)
             await session.flush()
@@ -153,10 +155,37 @@ async def main() -> None:
         else:
             print("Шаблон default уже есть")
 
-        # Привязываем default к каналам
+        result_aesthetic = await session.execute(
+            select(PromptTemplate).where(PromptTemplate.name == "aesthetic")
+        )
+        aesthetic_template = result_aesthetic.scalar_one_or_none()
+        if aesthetic_template is None:
+            aesthetic_data = prompts.get("aesthetic", {})
+            gen = aesthetic_data.get("generator", {})
+            crit = aesthetic_data.get("critic", {})
+            aesthetic_template = PromptTemplate(
+                name="aesthetic",
+                generator_system=gen.get("system", ""),
+                generator_user_template=gen.get("user_template", ""),
+                critic_system=crit.get("system", ""),
+                critic_user_template=crit.get("user_template", ""),
+                created_at=datetime.now(timezone.utc),
+            )
+            session.add(aesthetic_template)
+            await session.flush()
+            print("Создан шаблон промптов: aesthetic")
+        else:
+            print("Шаблон aesthetic уже есть")
+
+        # Привязка шаблона к каналу: channels.prompt_template_id -> prompt_templates.id
+        # llm_pipeline при генерации загружает channel с selectinload(prompt_template)
+        # и берёт промпты из channel.prompt_template (БД)
         for ch in channels_created:
-            ch.prompt_template_id = default_template.id
-        print("Шаблон default привязан ко всем каналам")
+            if ch.name == "Канал 2":
+                ch.prompt_template_id = aesthetic_template.id
+            else:
+                ch.prompt_template_id = default_template.id
+        print("Шаблоны привязаны: ЭТО ЗНАК -> default, Канал 2 -> aesthetic")
 
         await session.commit()
         # Перезагружаем сессию для дальнейших операций
