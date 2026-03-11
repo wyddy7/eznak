@@ -52,7 +52,7 @@ async def _publish_scheduled_posts() -> None:
         async with aiohttp.ClientSession() as http:
             for post in posts:
                 try:
-                    use_media = random.random() <= 1
+                    use_media = random.random() <= 0.03
                     photo_bytes = None
 
                     if use_media:
