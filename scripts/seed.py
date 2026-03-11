@@ -26,7 +26,7 @@ from backend.db.session import async_session_factory
 MSK = ZoneInfo("Europe/Moscow")
 
 CHANNELS = [
-    {"telegram_id": "-1003812297034", "name": "Канал 1"},
+    {"telegram_id": "-1003812297034", "name": "ЭТО ЗНАК"},
     {"telegram_id": "-1003592368865", "name": "Канал 2"},
 ]
 
@@ -89,7 +89,11 @@ async def main() -> None:
             )
             existing = result.scalar_one_or_none()
             if existing:
-                print(f"Канал уже есть: {existing.name} (telegram_id={existing.telegram_id})")
+                if existing.name != ch_data["name"]:
+                    existing.name = ch_data["name"]
+                    print(f"Обновлено имя канала: {ch_data['name']} (telegram_id={existing.telegram_id})")
+                else:
+                    print(f"Канал уже есть: {existing.name} (telegram_id={existing.telegram_id})")
                 channels_created.append(existing)
             else:
                 ch = Channel(
