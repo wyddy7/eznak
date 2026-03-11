@@ -91,6 +91,14 @@ def _update_message_status(msg: Message, new_status: str) -> str:
     return _append_status(text, new_status)
 
 
+def _has_phrase_number_in_text(text: str) -> bool:
+    """Проверяет, содержит ли текст «Фраза N» — может привести к мусору в канале."""
+    return bool(re.search(r"Фраза\s*\d+", text, re.IGNORECASE))
+
+
+PHRASE_WARNING = "\n\n⚠️ <b>Обнаружено «Фраза N» в тексте</b> — возможна ошибка выкладывания, в канал может попасть мусор!"
+
+
 def _parse_phrase_text(msg: Message) -> str:
     """Извлекает сырой текст из формата «Фраза N:\n{text}» или с суффиксом «Статус:»."""
     text = msg.text or msg.caption or ""
@@ -416,7 +424,11 @@ def _get_scheduled_channel_keyboard(
             builder.button(text="▶", callback_data=f"scheduled_page:{page + 1}")
 
     builder.button(text="← Другой канал", callback_data="scheduled_back")
-    builder.adjust(1)
+
+    n_cancel = len(page_posts)
+    n_pag = 2 if (page > 0 and page < total_pages - 1) else (1 if total_pages > 1 else 0)
+    sizes = [1] * n_cancel + ([n_pag] if n_pag else []) + [1]
+    builder.adjust(*sizes)
     return builder
 
 
@@ -528,8 +540,11 @@ async def cb_channel_select(callback: CallbackQuery, state: FSMContext) -> None:
         kb = get_phrase_keyboard(i)
         header = f"<b>Канал:</b> {channel_name}\n\n" if i == 0 else ""
         escaped = html.escape(phrase)
+        body = f"{header}<b>Фраза {i + 1}:</b>\n<pre>{escaped}</pre>"
+        if _has_phrase_number_in_text(phrase):
+            body += PHRASE_WARNING
         await callback.message.answer(
-            f"{header}<b>Фраза {i + 1}:</b>\n<pre>{escaped}</pre>",
+            body,
             reply_markup=kb.as_markup(),
         )
 
@@ -833,6 +848,8 @@ async def cb_approve(callback: CallbackQuery, state: FSMContext) -> None:
         approved_indices.append(phrase_idx)
     await state.update_data(phrases=phrases, approved_indices=approved_indices, approved_post_ids=approved_post_ids)
     new_text = _update_message_status(callback.message, "✅ Статус: Approved")
+    if _has_phrase_number_in_text(raw_text):
+        new_text += PHRASE_WARNING
     await callback.message.edit_text(new_text, reply_markup=None)
     await callback.answer("Одобрено")
 
@@ -901,6 +918,8 @@ async def process_edit_text(message: Message, state: FSMContext) -> None:
     await state.set_state(None)
     escaped = html.escape(message.text)
     new_text = f"<b>Фраза {phrase_num}:</b>\n<pre>{escaped}</pre>\n\n✏️ Статус: Отредактировано"
+    if _has_phrase_number_in_text(message.text):
+        new_text += PHRASE_WARNING
     kb = get_phrase_keyboard(phrase_idx).as_markup()
     await message.bot.edit_message_text(
         chat_id=chat_id,
