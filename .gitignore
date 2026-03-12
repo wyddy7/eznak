@@ -5,3 +5,4 @@ __pycache__/
 venv/
 *.egg-info/
 output.jpg
+references/
